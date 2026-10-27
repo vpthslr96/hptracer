@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HP Watcher v2.1 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
+HP Watcher v2.2 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
 нажатий клавиш по условиям. Все настройки — в config.json рядом со скриптом.
 Инструкция — в README.md.
 """
@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler
 
 import numpy as np
 
-VERSION = "2.1"
+VERSION = "2.2"
 IS_WIN = sys.platform == "win32"
 
 if IS_WIN:
@@ -65,6 +65,7 @@ LOG_PATH = os.path.join(app_dir(), "hp_watcher.log")
 
 BAR_KEYS = ["target_hp", "my_hp", "my_mp"]
 BAR_NAMES = {"target_hp": "HP цели", "my_hp": "моё HP", "my_mp": "моё MP"}
+VALUE_KEYS = BAR_KEYS + ["no_target_sec"]
 OVERLAY_COLORS = {"target_hp": "#ffd400", "my_hp": "#3cff6a", "my_mp": "#38d6ff"}
 EVENTS = {"target_died"}
 OPS = {"<": operator.lt, "<=": operator.le, ">": operator.gt,
@@ -101,6 +102,11 @@ DEFAULT_CONFIG = {
                      "Операции: < <= > >= == !=. Меньше priority — проверяется раньше. cooldown — секунды.",
         "actions": "Список [клавиша, пауза после нажатия в секундах]. Клавиши: f1..f12, 0..9, a..z, esc, enter, "
                    "space, tab, up/down/left/right. Сочетания через +: \"ctrl+1\". [\"wait\", 1.5] — просто пауза.",
+        "skill_keys": "Именованные кнопки панели скиллов. В действиях пишите \"@attack\" вместо \"f1\" — "
+                      "тогда при переносе скилла на другую клавишу достаточно поменять её здесь. "
+                      "Можно добавлять свои имена: \"buff\": \"f5\", \"heal\": \"alt+1\".",
+        "no_target_sec": "Условие {\"value\": \"no_target_sec\", \"op\": \">=\", \"than\": 4} — цели нет "
+                         "(или её HP = 0) уже 4 секунды. Нужно для сценария «Поиск цели».",
         "dry_run": "Тестовый режим: всё распознаётся и пишется в лог, но клавиши не нажимаются.",
         "emergency": "Аварийная пауза: on_death — при смерти (моё HP = 0); hp_drop_percent за hp_drop_seconds — "
                      "при резком падении HP (0 — выключено). Работает, только если откалибровано моё HP.",
@@ -108,6 +114,10 @@ DEFAULT_CONFIG = {
                        "keep — сколько последних хранить.",
     },
     "window_title": "Lineage",
+    "skill_keys": {
+        "attack": "f1",
+        "next_target": "f2",
+    },
     "dry_run": False,
     "emergency": {
         "on_death": True,
@@ -147,6 +157,7 @@ DEFAULT_CONFIG = {
         "record": "ctrl+alt+6",
         "dry_run": "ctrl+alt+7",
         "stats_reset": "ctrl+alt+8",
+        "run_now": "ctrl+alt+t",
         "reload": "ctrl+alt+9",
         "pause": "ctrl+alt+0",
         "exit": "ctrl+alt+end",
@@ -160,7 +171,15 @@ DEFAULT_CONFIG = {
             "priority": 10,
             "cooldown": 0,
             "conditions": [{"event": "target_died"}],
-            "actions": [],
+            "actions": [["@next_target", 0.4], ["@attack", 0.3]],
+        },
+        {
+            "name": "Поиск цели",
+            "enabled": False,
+            "priority": 20,
+            "cooldown": 3,
+            "conditions": [{"value": "no_target_sec", "op": ">=", "than": 4}],
+            "actions": [["@next_target", 0.4], ["@attack", 0.3]],
         },
         {
             "name": "Банка HP",
@@ -303,6 +322,23 @@ def parse_action(item):
     if isinstance(item, dict):
         return str(item["key"]).strip().lower(), float(item.get("delay", 0))
     return str(item).strip().lower(), 0.0
+
+
+def resolve_key(key, skill_keys):
+    """\"@attack\" -> клавиша из skill_keys. Обычная клавиша возвращается как есть.
+    None — такого имени нет."""
+    if key.startswith("@"):
+        k = skill_keys.get(key[1:])
+        return str(k).strip().lower() if k else None
+    return key
+
+
+def named_key(key, skill_keys):
+    """Обратное: клавиша -> \"@имя\", если она есть в skill_keys (для записи макроса)."""
+    for name, k in skill_keys.items():
+        if str(k).strip().lower() == key:
+            return "@" + name
+    return key
 
 
 def check_condition(cond, values, events):
@@ -609,6 +645,8 @@ class App:
         self.running = True
         self.paused = False
         self.pause_reason = None
+        self.manual_request = None
+        self.no_target_since = None
         self.recording = False
         self.stats = Stats()
         self.emergency = EmergencyDetector()
@@ -653,8 +691,28 @@ class App:
         with self.lock:
             self.cfg = deep_merge(DEFAULT_CONFIG, user)
             self.cfg_mtime = os.path.getmtime(CONFIG_PATH)
+            if self.migrate_config():
+                self.save_config()
         self.validate_config()
         return True
+
+    def migrate_config(self):
+        """Подтягивает новые сценарии по умолчанию в конфиг от прошлых версий."""
+        changed = False
+        scs = self.cfg.setdefault("scenarios", [])
+        by_name = {s.get("name"): s for s in scs}
+        for d in DEFAULT_CONFIG["scenarios"]:
+            cur = by_name.get(d["name"])
+            if cur is None:
+                scs.append(copy.deepcopy(d))
+                log.info("В config.json добавлен сценарий «%s» (%s)", d["name"],
+                         "включён" if d.get("enabled", True) else "выключен")
+                changed = True
+            elif not cur.get("actions") and d.get("actions"):
+                cur["actions"] = copy.deepcopy(d["actions"])
+                log.info("Сценарий «%s»: добавлены действия по умолчанию %s", d["name"], d["actions"])
+                changed = True
+        return changed
 
     def save_config(self):
         with self.lock:
@@ -694,6 +752,11 @@ class App:
                     continue
                 if key == "wait":
                     continue
+                real = resolve_key(key, self.cfg.get("skill_keys", {}))
+                if real is None:
+                    log.warning("Сценарий «%s»: кнопка %s не задана в skill_keys", name, key)
+                    continue
+                key = real
                 bad = [p for p in key.split("+") if p.strip() not in mapping]
                 if bad:
                     log.warning("Сценарий «%s»: неизвестная клавиша %s", name, ", ".join(bad))
@@ -701,8 +764,11 @@ class App:
                 if "event" in c:
                     if c["event"] not in EVENTS:
                         log.warning("Сценарий «%s»: неизвестное событие %r", name, c["event"])
-                elif c.get("value") not in BAR_KEYS or c.get("op", "<") not in OPS:
+                elif c.get("value") not in VALUE_KEYS or c.get("op", "<") not in OPS:
                     log.warning("Сценарий «%s»: непонятное условие %r", name, c)
+                elif c["value"] == "no_target_sec":
+                    if not bar_ready(self.cfg["bars"].get("target_hp")):
+                        log.warning("Сценарий «%s»: полоска HP цели ещё не откалибрована", name)
                 elif not bar_ready(self.cfg["bars"].get(c["value"])):
                     log.warning("Сценарий «%s»: полоска %s ещё не откалибрована",
                                 name, BAR_NAMES[c["value"]])
@@ -724,6 +790,7 @@ class App:
             "record": self.toggle_record,
             "dry_run": self.toggle_dry_run,
             "stats_reset": self.stats_reset,
+            "run_now": self.request_run_now,
             "reload": self.reload,
             "pause": self.toggle_pause,
             "exit": self.stop,
@@ -759,6 +826,7 @@ class App:
             ("record", "запись последовательности клавиш вкл/выкл"),
             ("dry_run", "тестовый режим вкл/выкл (без нажатий)"),
             ("stats_reset", "вывести статистику и обнулить"),
+            ("run_now", "проверка: сразу выполнить сценарий «после убийства»"),
             ("pause", "пауза / продолжить (и снять аварийную паузу)"),
             ("reload", "перечитать config.json"),
             ("exit", "выход"),
@@ -916,6 +984,27 @@ class App:
         if self.cfg["screenshots"].get("on_emergency", True):
             self.screenshot("АВАРИЯ " + reason)
 
+    def request_run_now(self):
+        name = self.cfg.get("record_into") or "После убийства моба"
+        sc = next((s for s in self.cfg.get("scenarios", []) if s.get("name") == name), None)
+        if sc is None or not sc.get("actions"):
+            log.warning("Сценарий «%s» не найден или пуст", name)
+            self.beep("error")
+            return
+        self.manual_request = name
+        log.info("Проверка: выполню «%s», как только отпустите Ctrl/Alt", name)
+
+    def wait_modifiers_released(self, timeout=2.0):
+        """Если пользователь держит Ctrl/Alt/Shift, игра получит Ctrl+F1 вместо F1.
+        Ждём, пока отпустит (не дольше timeout)."""
+        try:
+            import keyboard
+        except Exception:
+            return
+        end = time.time() + timeout
+        while time.time() < end and any(keyboard.is_pressed(m) for m in ("ctrl", "alt", "shift")):
+            time.sleep(0.02)
+
     def toggle_dry_run(self):
         with self.lock:
             self.cfg["dry_run"] = not self.cfg.get("dry_run", False)
@@ -1004,7 +1093,7 @@ class App:
         actions = []
         for i, (key, t) in enumerate(ev):
             delay = ev[i + 1][1] - t if i + 1 < len(ev) else self.cfg["record_last_delay"]
-            actions.append([key, round_delay(delay)])
+            actions.append([named_key(key, self.cfg.get("skill_keys", {})), round_delay(delay)])
         target = self.cfg.get("record_into") or "Записанный сценарий"
         with self.lock:
             sc = next((s for s in self.cfg["scenarios"] if s.get("name") == target), None)
@@ -1095,6 +1184,7 @@ class App:
             self.screenshot(name)
         ok = True
         hold = float(self.cfg.get("key_hold", 0.05))
+        skill_keys = self.cfg.get("skill_keys", {})
         try:
             for item in sc["actions"]:
                 key, delay = parse_action(item)
@@ -1102,15 +1192,23 @@ class App:
                     ok = False
                     break
                 if key != "wait":
-                    if dry:
-                        log.info("  [тест] нажал бы %s, пауза %g c", key, delay)
+                    real = resolve_key(key, skill_keys)
+                    label = key if real == key else f"{key} ({real})"
+                    if real is None:
+                        log.warning("  %s не задана в skill_keys — пропускаю", key)
+                    elif dry:
+                        log.info("  [тест] нажал бы %s, пауза %g c", label, delay)
                     else:
-                        press_key(key, hold)
+                        self.wait_modifiers_released()
+                        press_key(real, hold)
+                        log.info("  нажал %s", label)
                 if not self.sleep_interruptible(delay):
                     ok = False
                     break
         finally:
             self.executing = None
+            if self.no_target_since is not None:
+                self.no_target_since = time.time()  # «цели нет» считаем от последней попытки
         self.last_action = f"{name}, {time.strftime('%H:%M:%S')}" + ("" if ok else " (прервано)")
         if not ok:
             reason = self.pause_reason or "пауза, выход или окно игры не активно"
@@ -1146,12 +1244,20 @@ class App:
                     vals[key] = read_bar(self._sct, ox, oy, bar)
                 except Exception:
                     pass  # полоска за пределами экрана
+        t = vals.get("target_hp")
+        if bar_ready(cfg["bars"].get("target_hp")):
+            if t is None or t <= 0:
+                if self.no_target_since is None:
+                    self.no_target_since = now
+                vals["no_target_sec"] = now - self.no_target_since
+            else:
+                self.no_target_since = None
+                vals["no_target_sec"] = 0.0
         self.values = vals
 
         if active and not self.paused and not self.recording and dt < 2:
             self.stats.active += dt
 
-        t = vals.get("target_hp")
         if t is not None:
             if t > 0:
                 self.target_alive = True
@@ -1189,6 +1295,12 @@ class App:
         if self.origin is None or self.paused or self.recording:
             return
         if self.cfg.get("only_when_window_active", True) and not self.window_active:
+            return
+        if self.manual_request:
+            name, self.manual_request = self.manual_request, None
+            sc = next((s for s in self.cfg.get("scenarios", []) if s.get("name") == name), None)
+            if sc:
+                self.run_scenario(sc)
             return
         sc = self.pick_scenario(self.values, time.time())
         if sc:
@@ -1240,9 +1352,16 @@ class App:
             f"Цель HP: {pct('target_hp')}",
             f"Моё HP:  {pct('my_hp')}   MP: {pct('my_mp')}",
             self.stats.short(),
+            self.keys_line(),
             f"Калибровка: {BAR_NAMES[BAR_KEYS[self.calib_index]]}",
             f"Последнее: {self.last_action}",
         ])
+
+    def keys_line(self):
+        sk = self.cfg.get("skill_keys", {})
+        names = {"attack": "атака", "next_target": "след. цель"}
+        parts = [f"{names.get(n, n)} {str(k).upper()}" for n, k in sk.items() if k]
+        return "Кнопки: " + (", ".join(parts) if parts else "не заданы")
 
     def status_colors(self):
         """Фон окна статуса: красный — авария, жёлтый — тестовый режим."""
