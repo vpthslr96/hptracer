@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HP Watcher v2.2 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
+HP Watcher v2.3 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
 нажатий клавиш по условиям. Все настройки — в config.json рядом со скриптом.
 Инструкция — в README.md.
 """
@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler
 
 import numpy as np
 
-VERSION = "2.2"
+VERSION = "2.3"
 IS_WIN = sys.platform == "win32"
 
 if IS_WIN:
@@ -66,6 +66,7 @@ LOG_PATH = os.path.join(app_dir(), "hp_watcher.log")
 BAR_KEYS = ["target_hp", "my_hp", "my_mp"]
 BAR_NAMES = {"target_hp": "HP цели", "my_hp": "моё HP", "my_mp": "моё MP"}
 VALUE_KEYS = BAR_KEYS + ["no_target_sec"]
+MIN_REPEAT = 0.3  # сценарий без события не повторяется чаще, чем раз в столько секунд
 OVERLAY_COLORS = {"target_hp": "#ffd400", "my_hp": "#3cff6a", "my_mp": "#38d6ff"}
 EVENTS = {"target_died"}
 OPS = {"<": operator.lt, "<=": operator.le, ">": operator.gt,
@@ -135,6 +136,7 @@ DEFAULT_CONFIG = {
     },
     "only_when_window_active": True,
     "check_interval": 0.1,
+    "min_gap": 0.2,
     "dead_confirm": 3,
     "event_ttl": 3.0,
     "key_hold": 0.05,
@@ -158,10 +160,12 @@ DEFAULT_CONFIG = {
         "dry_run": "ctrl+alt+7",
         "stats_reset": "ctrl+alt+8",
         "run_now": "ctrl+alt+t",
+        "settings": "ctrl+alt+s",
         "reload": "ctrl+alt+9",
         "pause": "ctrl+alt+0",
         "exit": "ctrl+alt+end",
     },
+    "offered_defaults": [],
     "record_into": "После убийства моба",
     "record_last_delay": 0.5,
     "scenarios": [
@@ -180,6 +184,22 @@ DEFAULT_CONFIG = {
             "cooldown": 3,
             "conditions": [{"value": "no_target_sec", "op": ">=", "than": 4}],
             "actions": [["@next_target", 0.4], ["@attack", 0.3]],
+        },
+        {
+            "name": "Скилл в бою",
+            "enabled": False,
+            "priority": 30,
+            "cooldown": 5,
+            "conditions": [{"value": "target_hp", "op": ">", "than": 0}],
+            "actions": [["f3", 0.5]],
+        },
+        {
+            "name": "Бафф",
+            "enabled": False,
+            "priority": 40,
+            "cooldown": 1200,
+            "conditions": [{"value": "no_target_sec", "op": ">=", "than": 1}],
+            "actions": [["f5", 2.0]],
         },
         {
             "name": "Банка HP",
@@ -207,11 +227,16 @@ log = logging.getLogger("hpw")
 #  Чистая логика (без Windows) — её можно тестировать где угодно
 # ============================================================
 
+REPLACE_WHOLE = {"skill_keys"}  # эти словари пользователь редактирует целиком — не подмешивать умолчания
+
+
 def deep_merge(base, override):
     """Добавляет в настройки пользователя ключи, которых там ещё нет."""
     out = copy.deepcopy(base)
     for k, v in override.items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
+        if k in REPLACE_WHOLE:
+            out[k] = copy.deepcopy(v)
+        elif isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = deep_merge(out[k], v)
         else:
             out[k] = v
@@ -646,6 +671,9 @@ class App:
         self.paused = False
         self.pause_reason = None
         self.manual_request = None
+        self.manual_request_time = 0.0
+        self.last_scenario_end = 0.0
+        self.ui_requests = deque()
         self.no_target_since = None
         self.recording = False
         self.stats = Stats()
@@ -676,6 +704,7 @@ class App:
         if not os.path.exists(CONFIG_PATH):
             with self.lock:
                 self.cfg = copy.deepcopy(DEFAULT_CONFIG)
+                self.migrate_config()  # только отметит готовые сценарии как предложенные
             self.save_config()
             log.info("Создан config.json с настройками по умолчанию")
             return True
@@ -697,21 +726,28 @@ class App:
         return True
 
     def migrate_config(self):
-        """Подтягивает новые сценарии по умолчанию в конфиг от прошлых версий."""
+        """Подтягивает новые сценарии по умолчанию в конфиг от прошлых версий.
+        Каждый готовый сценарий предлагается один раз: если его потом удалили — не возвращаем."""
         changed = False
         scs = self.cfg.setdefault("scenarios", [])
+        offered = self.cfg.get("offered_defaults")
+        if not isinstance(offered, list):
+            offered = []
         by_name = {s.get("name"): s for s in scs}
         for d in DEFAULT_CONFIG["scenarios"]:
+            if d["name"] in offered:
+                continue
+            offered.append(d["name"])
+            changed = True
             cur = by_name.get(d["name"])
             if cur is None:
                 scs.append(copy.deepcopy(d))
                 log.info("В config.json добавлен сценарий «%s» (%s)", d["name"],
                          "включён" if d.get("enabled", True) else "выключен")
-                changed = True
             elif not cur.get("actions") and d.get("actions"):
                 cur["actions"] = copy.deepcopy(d["actions"])
                 log.info("Сценарий «%s»: добавлены действия по умолчанию %s", d["name"], d["actions"])
-                changed = True
+        self.cfg["offered_defaults"] = offered
         return changed
 
     def save_config(self):
@@ -791,6 +827,7 @@ class App:
             "dry_run": self.toggle_dry_run,
             "stats_reset": self.stats_reset,
             "run_now": self.request_run_now,
+            "settings": self.open_settings,
             "reload": self.reload,
             "pause": self.toggle_pause,
             "exit": self.stop,
@@ -827,6 +864,7 @@ class App:
             ("dry_run", "тестовый режим вкл/выкл (без нажатий)"),
             ("stats_reset", "вывести статистику и обнулить"),
             ("run_now", "проверка: сразу выполнить сценарий «после убийства»"),
+            ("settings", "окно настроек"),
             ("pause", "пауза / продолжить (и снять аварийную паузу)"),
             ("reload", "перечитать config.json"),
             ("exit", "выход"),
@@ -991,8 +1029,27 @@ class App:
             log.warning("Сценарий «%s» не найден или пуст", name)
             self.beep("error")
             return
+        self.request_run(name)
+
+    def request_run(self, name):
+        """Выполнить сценарий вне очереди, как только окно игры станет активным (ждём до 15 с)."""
         self.manual_request = name
-        log.info("Проверка: выполню «%s», как только отпустите Ctrl/Alt", name)
+        self.manual_request_time = time.time()
+        log.info("Проверка: выполню «%s», когда окно игры будет активно и Ctrl/Alt отпущены", name)
+
+    def open_settings(self):
+        self.ui_requests.append("settings")
+
+    def apply_config(self, new_cfg):
+        """Применить настройки из окна: сохранить, проверить, переназначить горячие клавиши."""
+        with self.lock:
+            self.cfg = deep_merge(DEFAULT_CONFIG, new_cfg)
+            self.save_config()
+        log.info("Настройки сохранены")
+        self.validate_config()
+        if self.cfg["hotkeys"] != self._hotkeys_registered:
+            self.register_hotkeys()
+        self.beep("calib")
 
     def wait_modifiers_released(self, timeout=2.0):
         """Если пользователь держит Ctrl/Alt/Shift, игра получит Ctrl+F1 вместо F1.
@@ -1159,13 +1216,19 @@ class App:
             time.sleep(min(0.05, left))
 
     def pick_scenario(self, values, now):
+        if now - self.last_scenario_end < float(self.cfg.get("min_gap", 0.2)):
+            return None
         cands = [s for s in self.cfg.get("scenarios", [])
-                 if s.get("enabled", True) and s.get("conditions") and s.get("actions")]
+                 if s.get("enabled", True) and s.get("actions")]
         cands.sort(key=lambda s: s.get("priority", 100))
         for s in cands:
-            if now - self.last_run.get(s.get("name"), 0) < float(s.get("cooldown", 0)):
+            conds = s.get("conditions") or []
+            repeat = float(s.get("cooldown", 0) or 0)
+            if not any("event" in c for c in conds):
+                repeat = max(repeat, MIN_REPEAT)  # защита от нажатий каждый кадр
+            if now - self.last_run.get(s.get("name"), 0) < repeat:
                 continue
-            if all(check_condition(c, values, self.events) for c in s["conditions"]):
+            if all(check_condition(c, values, self.events) for c in conds):
                 return s
         return None
 
@@ -1207,6 +1270,7 @@ class App:
                     break
         finally:
             self.executing = None
+            self.last_scenario_end = time.time()
             if self.no_target_since is not None:
                 self.no_target_since = time.time()  # «цели нет» считаем от последней попытки
         self.last_action = f"{name}, {time.strftime('%H:%M:%S')}" + ("" if ok else " (прервано)")
@@ -1296,6 +1360,9 @@ class App:
             return
         if self.cfg.get("only_when_window_active", True) and not self.window_active:
             return
+        if self.manual_request and time.time() - self.manual_request_time > 15:
+            log.info("Проверка «%s» отменена: окно игры так и не стало активным", self.manual_request)
+            self.manual_request = None
         if self.manual_request:
             name, self.manual_request = self.manual_request, None
             sc = next((s for s in self.cfg.get("scenarios", []) if s.get("name") == name), None)
@@ -1388,28 +1455,44 @@ class Overlay:
         import tkinter as tk
         self.app = app
         self.tk = tk
+        self.show = bool(app.cfg.get("overlay", True))
         self.root = tk.Tk()
         self.root.title("HP Watcher")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.88)
+        self.root.attributes("-alpha", 0.9)
         self.root.configure(bg="#1d1f24")
         x, y = app.cfg.get("status_window_pos", [20, 200])
         self.root.geometry(f"+{int(x)}+{int(y)}")
         self.label = tk.Label(self.root, text="", justify="left", anchor="w",
                               font=("Consolas", 10), fg="#e6e6e6", bg="#1d1f24",
-                              padx=10, pady=6)
-        self.label.pack()
-        for w in (self.root, self.label):
-            w.bind("<ButtonPress-1>", self._drag_start)
-            w.bind("<B1-Motion>", self._drag_move)
-            w.bind("<ButtonRelease-1>", self._drag_end)
-            w.bind("<Double-Button-1>", lambda e: app.toggle_pause())
+                              padx=10, pady=6, cursor="fleur")
+        self.label.pack(fill="x")
+        self.label.bind("<ButtonPress-1>", self._drag_start)
+        self.label.bind("<B1-Motion>", self._drag_move)
+        self.label.bind("<ButtonRelease-1>", self._drag_end)
+        self.label.bind("<Double-Button-1>", lambda e: app.toggle_pause())
+
+        self.btns = tk.Frame(self.root, bg="#1d1f24")
+        self.btns.pack(fill="x", padx=6, pady=(0, 6))
+        self.buttons = []
+        for text, cmd in (("⚙ Настройки", app.open_settings),
+                          ("⏸ Пауза", lambda: threading.Thread(target=app.toggle_pause, daemon=True).start()),
+                          ("Тест", lambda: threading.Thread(target=app.toggle_dry_run, daemon=True).start())):
+            b = tk.Label(self.btns, text=text, font=("Segoe UI", 9), fg="#e6e6e6", bg="#30343c",
+                         padx=8, pady=2, cursor="hand2")
+            b.pack(side="left", padx=2)
+            b.bind("<Button-1>", lambda e, cmd=cmd: cmd())
+            b.bind("<Enter>", lambda e, b=b: b.config(bg="#475060"))
+            b.bind("<Leave>", lambda e, b=b: b.config(bg="#30343c"))
+            self.buttons.append(b)
         self.root.update_idletasks()
         self._style(self.root, self.WS_EX_TOOLWINDOW | self.WS_EX_NOACTIVATE)
+        if not self.show:
+            self.root.withdraw()  # окно статуса выключено, но настройки по Ctrl+Alt+S работают
 
         self.frames = None
-        if app.cfg.get("overlay_frames", True):
+        if self.show and app.cfg.get("overlay_frames", True):
             self.vx, self.vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
             vw, vh = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)
             self.frames = tk.Toplevel(self.root)
@@ -1435,6 +1518,8 @@ class Overlay:
 
     def _keep_on_top(self):
         # HWND_TOPMOST без активации, чтобы не забирать фокус у игры
+        if not self.show:
+            return
         for w in (self.root, self.frames):
             if w is not None:
                 user32.SetWindowPos(self._hwnd(w), wt.HWND(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
@@ -1475,9 +1560,20 @@ class Overlay:
         if not self.app.running:
             self.root.destroy()
             return
+        while self.app.ui_requests:
+            req = self.app.ui_requests.popleft()
+            if req == "settings":
+                try:
+                    import settings_ui
+                    settings_ui.SettingsWindow.open(self.root, self.app)
+                except Exception:
+                    log.exception("Не удалось открыть настройки")
         bg = self.app.status_colors()
         self.label.config(text=self.app.status_text(), bg=bg)
         self.root.configure(bg=bg)
+        self.btns.configure(bg=bg)
+        self.buttons[1].config(text="▶ Продолжить" if self.app.paused else "⏸ Пауза")
+        self.buttons[2].config(text="Тест: вкл" if self.app.cfg.get("dry_run") else "Тест: выкл")
         if self.frames is not None:
             self._draw_frames()
         now = time.time()
@@ -1536,11 +1632,10 @@ def main():
     threading.Thread(target=app.worker, daemon=True).start()
     app.beep("start")
 
-    if app.cfg.get("overlay", True):
-        try:
-            Overlay(app).run()
-        except Exception:
-            log.exception("Оверлей не запустился, работаю без него")
+    try:
+        Overlay(app).run()
+    except Exception:
+        log.exception("Оверлей не запустился, работаю без него")
     while app.running:
         time.sleep(0.2)
     time.sleep(0.3)

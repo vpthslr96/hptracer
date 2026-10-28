@@ -24,10 +24,10 @@ jobs:
           python -m pip install -r requirements.txt pyinstaller
 
       - name: Import check
-        run: python -c "import hp_watcher, mss, keyboard, pydirectinput, numpy, tkinter; print('imports ok', hp_watcher.VERSION)"
+        run: python -c "import hp_watcher, settings_ui, mss, keyboard, pydirectinput, numpy, tkinter; print('imports ok', hp_watcher.VERSION)"
 
       - name: Build exe
-        run: python -m PyInstaller --noconfirm --onefile --uac-admin --name HPWatcher hp_watcher.py
+        run: python -m PyInstaller --noconfirm --onefile --uac-admin --hidden-import settings_ui --name HPWatcher hp_watcher.py
 
       - name: Package
         shell: pwsh

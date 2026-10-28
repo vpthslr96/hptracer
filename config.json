@@ -32,6 +32,7 @@
   },
   "only_when_window_active": true,
   "check_interval": 0.1,
+  "min_gap": 0.2,
   "dead_confirm": 3,
   "event_ttl": 3.0,
   "key_hold": 0.05,
@@ -88,10 +89,19 @@
     "dry_run": "ctrl+alt+7",
     "stats_reset": "ctrl+alt+8",
     "run_now": "ctrl+alt+t",
+    "settings": "ctrl+alt+s",
     "reload": "ctrl+alt+9",
     "pause": "ctrl+alt+0",
     "exit": "ctrl+alt+end"
   },
+  "offered_defaults": [
+    "После убийства моба",
+    "Поиск цели",
+    "Скилл в бою",
+    "Бафф",
+    "Банка HP",
+    "Банка MP"
+  ],
   "record_into": "После убийства моба",
   "record_last_delay": 0.5,
   "scenarios": [
@@ -136,6 +146,44 @@
         [
           "@attack",
           0.3
+        ]
+      ]
+    },
+    {
+      "name": "Скилл в бою",
+      "enabled": false,
+      "priority": 30,
+      "cooldown": 5,
+      "conditions": [
+        {
+          "value": "target_hp",
+          "op": ">",
+          "than": 0
+        }
+      ],
+      "actions": [
+        [
+          "f3",
+          0.5
+        ]
+      ]
+    },
+    {
+      "name": "Бафф",
+      "enabled": false,
+      "priority": 40,
+      "cooldown": 1200,
+      "conditions": [
+        {
+          "value": "no_target_sec",
+          "op": ">=",
+          "than": 1
+        }
+      ],
+      "actions": [
+        [
+          "f5",
+          2.0
         ]
       ]
     },
