@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HP Watcher v2.4 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
+HP Watcher v2.5 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
 нажатий клавиш по условиям. Все настройки — в config.json рядом со скриптом.
 Инструкция — в README.md.
 """
@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler
 
 import numpy as np
 
-VERSION = "2.4"
+VERSION = "2.5"
 IS_WIN = sys.platform == "win32"
 
 if IS_WIN:
@@ -108,6 +108,14 @@ DEFAULT_CONFIG = {
                       "Можно добавлять свои имена: \"buff\": \"f5\", \"heal\": \"alt+1\".",
         "no_target_sec": "Условие {\"value\": \"no_target_sec\", \"op\": \">=\", \"than\": 4} — цели нет "
                          "(или её HP = 0) уже 4 секунды. Нужно для сценария «Поиск цели».",
+        "input": "Способ ввода: sendinput — обычный; interception — через драйвер Interception "
+                 "(нужны установленный драйвер и interception.dll рядом с программой). "
+                 "Если драйвер не загрузится, программа сама вернётся к sendinput.",
+        "clicker": "Автокликер: mode — toggle (вкл/выкл горячей клавишей), hold (пока зажата hold_key), "
+                   "target (включён и цель жива); cps — кликов в секунду; jitter — разброс интервала, %; "
+                   "hold_ms — сколько держать кнопку; point — [x, y] относительно окна игры или null (где курсор).",
+        "mouse_steps": "Шаги мыши в сценариях: \"click:left\", \"click:right@120,340\" (точка в окне игры), "
+                       "\"dblclick:left\", \"click:left*5\" (серия с частотой автокликера), \"move@300,200\".",
         "vision": "Зрение: band — сколько строк пикселей читать (медиана); min_confidence — % согласия "
                   "с моделью «заливка слева, пусто справа», ниже — значение недостоверно и не используется; "
                   "min_coverage — % столбцов, похожих на полоску, ниже — полоски нет на экране; "
@@ -142,6 +150,21 @@ DEFAULT_CONFIG = {
     "only_when_window_active": True,
     "check_interval": 0.1,
     "min_gap": 0.2,
+    "input": {
+        "backend": "sendinput",
+        "interception_dll": "",
+    },
+    "clicker": {
+        "enabled": False,
+        "mode": "toggle",
+        "button": "left",
+        "cps": 10,
+        "jitter": 15,
+        "hold_ms": [8, 20],
+        "hold_key": "x",
+        "point": None,
+        "return_cursor": True,
+    },
     "vision": {
         "band": 3,
         "min_confidence": 90,
@@ -174,6 +197,7 @@ DEFAULT_CONFIG = {
         "stats_reset": "ctrl+alt+8",
         "run_now": "ctrl+alt+t",
         "settings": "ctrl+alt+s",
+        "clicker_toggle": "ctrl+alt+c",
         "reload": "ctrl+alt+9",
         "pause": "ctrl+alt+0",
         "exit": "ctrl+alt+end",
@@ -568,6 +592,7 @@ class Stats:
         self.active = 0.0
         self.kills = 0
         self.lost = 0
+        self.clicks = 0
         self.emergencies = 0
         self.scenarios = {}
 
@@ -589,6 +614,8 @@ class Stats:
                  f"Убийств: {self.kills}"]
         if self.lost:
             lines.append(f"Потеряно целей (не убиты): {self.lost}")
+        if self.clicks:
+            lines.append(f"Кликов автокликера: {self.clicks}")
         ph = self.per_hour()
         if ph is not None:
             lines.append(f"В час: {ph:.1f}, в среднем {self.active / max(1, self.kills):.1f} c на моба")
@@ -799,21 +826,290 @@ def key_name_from_event(e):
     return _scan_to_name.get(e.scan_code)
 
 
+# ============================================================
+#  Ввод: SendInput (обычный) или драйвер Interception
+# ============================================================
+
+# Скан-коды набора 1: имя -> (код, расширенная клавиша E0)
+SCAN_CODES = {
+    "esc": (0x01, False), "1": (0x02, False), "2": (0x03, False), "3": (0x04, False), "4": (0x05, False),
+    "5": (0x06, False), "6": (0x07, False), "7": (0x08, False), "8": (0x09, False), "9": (0x0A, False),
+    "0": (0x0B, False), "-": (0x0C, False), "=": (0x0D, False), "backspace": (0x0E, False), "tab": (0x0F, False),
+    "q": (0x10, False), "w": (0x11, False), "e": (0x12, False), "r": (0x13, False), "t": (0x14, False),
+    "y": (0x15, False), "u": (0x16, False), "i": (0x17, False), "o": (0x18, False), "p": (0x19, False),
+    "[": (0x1A, False), "]": (0x1B, False), "enter": (0x1C, False), "ctrl": (0x1D, False),
+    "a": (0x1E, False), "s": (0x1F, False), "d": (0x20, False), "f": (0x21, False), "g": (0x22, False),
+    "h": (0x23, False), "j": (0x24, False), "k": (0x25, False), "l": (0x26, False), ";": (0x27, False),
+    "'": (0x28, False), "`": (0x29, False), "shift": (0x2A, False), "\\": (0x2B, False),
+    "z": (0x2C, False), "x": (0x2D, False), "c": (0x2E, False), "v": (0x2F, False), "b": (0x30, False),
+    "n": (0x31, False), "m": (0x32, False), ",": (0x33, False), ".": (0x34, False), "/": (0x35, False),
+    "shiftright": (0x36, False), "multiply": (0x37, False), "alt": (0x38, False), "space": (0x39, False),
+    "capslock": (0x3A, False), "f1": (0x3B, False), "f2": (0x3C, False), "f3": (0x3D, False),
+    "f4": (0x3E, False), "f5": (0x3F, False), "f6": (0x40, False), "f7": (0x41, False), "f8": (0x42, False),
+    "f9": (0x43, False), "f10": (0x44, False), "numlock": (0x45, False), "scrolllock": (0x46, False),
+    "subtract": (0x4A, False), "add": (0x4E, False), "decimal": (0x53, False),
+    "f11": (0x57, False), "f12": (0x58, False),
+    "home": (0x47, True), "up": (0x48, True), "pageup": (0x49, True), "left": (0x4B, True),
+    "right": (0x4D, True), "end": (0x4F, True), "down": (0x50, True), "pagedown": (0x51, True),
+    "insert": (0x52, True), "delete": (0x53, True), "divide": (0x35, True), "ctrlright": (0x1D, True),
+    "altright": (0x38, True), "win": (0x5B, True), "winright": (0x5C, True), "apps": (0x5D, True),
+    "printscreen": (0x37, True),
+}
+SCAN_ALIASES = {"escape": "esc", "return": "enter", "ctrlleft": "ctrl", "altleft": "alt",
+                "shiftleft": "shift", "del": "delete", "winleft": "win", " ": "space",
+                "prntscrn": "printscreen", "prtsc": "printscreen", "prtscr": "printscreen"}
+
+MOUSE_BUTTONS = ("left", "right", "middle")
+MOUSE_RE = re.compile(r"^(click|dblclick|move)(?::(left|right|middle))?(?:\*(\d{1,3}))?(?:@(-?\d+),(-?\d+))?$")
+
+
+def scan_code(name):
+    name = SCAN_ALIASES.get(name, name)
+    return SCAN_CODES.get(name)
+
+
+def known_keys():
+    """Все имена клавиш, которые умеет хотя бы один способ ввода."""
+    names = set(SCAN_CODES) | set(SCAN_ALIASES)
+    try:
+        import pydirectinput
+        names |= set(pydirectinput.KEYBOARD_MAPPING)
+    except Exception:
+        pass
+    return names
+
+
+def parse_mouse(key):
+    """«click:left», «click:right@120,340», «dblclick:left», «click:left*5», «move@300,200».
+    Точка — относительно окна игры. Возвращает dict или None, если это не шаг мыши."""
+    m = MOUSE_RE.match((key or "").strip().lower())
+    if not m:
+        return None
+    kind, button, count, x, y = m.groups()
+    if kind == "move" and x is None:
+        return None
+    return {"kind": kind, "button": button or "left", "count": max(1, int(count or 1)),
+            "point": (int(x), int(y)) if x is not None else None}
+
+
+def mouse_spec(kind="click", button="left", count=1, point=None):
+    s = kind if kind == "move" else f"{kind}:{button}"
+    if count > 1 and kind != "move":
+        s += f"*{count}"
+    if point is not None:
+        s += f"@{int(point[0])},{int(point[1])}"
+    return s
+
+
+def describe_mouse(spec):
+    names = {"left": "ЛКМ", "right": "ПКМ", "middle": "СКМ"}
+    if spec["kind"] == "move":
+        what = "курсор"
+    else:
+        what = ("двойной " if spec["kind"] == "dblclick" else "") + names[spec["button"]]
+        if spec["count"] > 1:
+            what += f" ×{spec['count']}"
+    return what + (f" в ({spec['point'][0]}, {spec['point'][1]})" if spec["point"] else "")
+
+
+def virtual_screen():
+    if not IS_WIN:
+        return 0, 0, 1920, 1080
+    return (user32.GetSystemMetrics(76), user32.GetSystemMetrics(77),
+            user32.GetSystemMetrics(78), user32.GetSystemMetrics(79))
+
+
+class SendInputBackend:
+    """Обычный ввод через SendInput (pydirectinput): скан-коды клавиш, мышь."""
+    name = "SendInput"
+
+    def __init__(self):
+        import pydirectinput
+        pydirectinput.PAUSE = 0
+        pydirectinput.FAILSAFE = False
+        self.pdi = pydirectinput
+        self.status = "SendInput"
+
+    def key_down(self, k):
+        self.pdi.keyDown(k)
+
+    def key_up(self, k):
+        self.pdi.keyUp(k)
+
+    def mouse_button(self, button, down):
+        (self.pdi.mouseDown if down else self.pdi.mouseUp)(button=button)
+
+    def mouse_move(self, x, y):
+        if IS_WIN:
+            user32.SetCursorPos(int(x), int(y))
+        else:
+            self.pdi.moveTo(int(x), int(y))
+
+    def close(self):
+        pass
+
+
+class KeyStroke(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_ushort), ("state", ctypes.c_ushort), ("information", ctypes.c_uint)]
+
+
+class MouseStroke(ctypes.Structure):
+    _fields_ = [("state", ctypes.c_ushort), ("flags", ctypes.c_ushort), ("rolling", ctypes.c_short),
+                ("x", ctypes.c_int), ("y", ctypes.c_int), ("information", ctypes.c_uint)]
+
+
+class InterceptionBackend:
+    """Ввод через драйвер Interception: нажатия идут от имени настоящих клавиатуры и мыши.
+    Нужны установленный драйвер (install-interception.exe /install + перезагрузка)
+    и interception.dll рядом с программой."""
+    name = "Interception"
+    KEY_DOWN, KEY_UP, KEY_E0 = 0x00, 0x01, 0x02
+    MOUSE_STATES = {"left": (0x001, 0x002), "right": (0x004, 0x008), "middle": (0x010, 0x020)}
+    MOVE_ABSOLUTE, VIRTUAL_DESKTOP = 0x001, 0x002
+
+    def __init__(self, dll_path=None, lib=None):
+        if lib is None:
+            lib = self._load(dll_path)
+        self.lib = lib
+        self.ctx = lib.interception_create_context()
+        if not self.ctx:
+            raise RuntimeError("драйвер не отвечает — он установлен и была перезагрузка?")
+        self.keyboard = self._find(1, 10)
+        self.mouse = self._find(11, 20)
+        if self.keyboard is None and self.mouse is None:
+            self.close()
+            raise RuntimeError("драйвер не видит ни клавиатуру, ни мышь")
+        self.status = (f"Interception (клавиатура #{self.keyboard or '—'}, мышь #{self.mouse or '—'})")
+
+    @staticmethod
+    def _load(dll_path):
+        cands = [dll_path] if dll_path else []
+        cands += [os.path.join(app_dir(), "interception.dll"), os.path.join(app_dir(), "x64", "interception.dll")]
+        path = next((c for c in cands if c and os.path.exists(c)), None)
+        if path is None:
+            raise RuntimeError("не найден interception.dll (положите его рядом с программой)")
+        lib = ctypes.CDLL(path)
+        lib.interception_create_context.restype = ctypes.c_void_p
+        lib.interception_destroy_context.argtypes = [ctypes.c_void_p]
+        lib.interception_send.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
+        lib.interception_send.restype = ctypes.c_int
+        lib.interception_get_hardware_id.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
+        lib.interception_get_hardware_id.restype = ctypes.c_uint
+        return lib
+
+    def _find(self, first, last):
+        buf = ctypes.create_unicode_buffer(500)
+        for dev in range(first, last + 1):
+            if self.lib.interception_get_hardware_id(self.ctx, dev, buf, ctypes.sizeof(buf)) > 0:
+                return dev
+        return None
+
+    def _key(self, k, up):
+        sc = scan_code(k)
+        if sc is None:
+            raise ValueError(f"нет скан-кода для клавиши {k}")
+        if self.keyboard is None:
+            raise RuntimeError("драйвер не нашёл клавиатуру")
+        code, e0 = sc
+        state = (self.KEY_UP if up else self.KEY_DOWN) | (self.KEY_E0 if e0 else 0)
+        stroke = KeyStroke(code=code, state=state)
+        self.lib.interception_send(self.ctx, self.keyboard, ctypes.byref(stroke), 1)
+
+    def key_down(self, k):
+        self._key(k, False)
+
+    def key_up(self, k):
+        self._key(k, True)
+
+    def _mouse(self, stroke):
+        if self.mouse is None:
+            raise RuntimeError("драйвер не нашёл мышь")
+        self.lib.interception_send(self.ctx, self.mouse, ctypes.byref(stroke), 1)
+
+    def mouse_button(self, button, down):
+        d, u = self.MOUSE_STATES[button]
+        self._mouse(MouseStroke(state=d if down else u))
+
+    def mouse_move(self, x, y):
+        vx, vy, vw, vh = virtual_screen()
+        nx = int(round((x - vx) * 65535 / max(1, vw - 1)))
+        ny = int(round((y - vy) * 65535 / max(1, vh - 1)))
+        self._mouse(MouseStroke(flags=self.MOVE_ABSOLUTE | self.VIRTUAL_DESKTOP, x=nx, y=ny))
+
+    def close(self):
+        if getattr(self, "ctx", None):
+            self.lib.interception_destroy_context(self.ctx)
+            self.ctx = None
+
+
+INPUT = None               # текущий способ ввода
+INPUT_LOCK = threading.RLock()
+
+
+def make_input(cfg_input):
+    """Создаёт способ ввода по настройкам. Если драйвер не загрузился — откат на SendInput.
+    Возвращает (backend, сообщение об ошибке или None)."""
+    want = (cfg_input or {}).get("backend", "sendinput")
+    if want == "interception":
+        try:
+            return InterceptionBackend((cfg_input or {}).get("interception_dll") or None), None
+        except Exception as e:
+            err = f"Interception не загрузился: {e}. Работаю через SendInput."
+            return SendInputBackend(), err
+    return SendInputBackend(), None
+
+
 def press_key(key, hold):
-    import pydirectinput
     parts = [p.strip() for p in key.lower().split("+") if p.strip()]
     if not parts:
         return
     *mods, main = parts
-    for m in mods:
-        pydirectinput.keyDown(m)
-    try:
-        pydirectinput.keyDown(main)
+    with INPUT_LOCK:
+        for m in mods:
+            INPUT.key_down(m)
+        try:
+            INPUT.key_down(main)
+            time.sleep(hold)
+            INPUT.key_up(main)
+        finally:
+            for m in reversed(mods):
+                INPUT.key_up(m)
+
+
+def mouse_click(button, hold):
+    with INPUT_LOCK:
+        INPUT.mouse_button(button, True)
         time.sleep(hold)
-        pydirectinput.keyUp(main)
-    finally:
-        for m in reversed(mods):
-            pydirectinput.keyUp(m)
+        INPUT.mouse_button(button, False)
+
+
+def perform_mouse(spec, hold, origin, interval=0.1, return_cursor=True):
+    """Выполняет шаг мыши. origin — (x, y, w, h) окна игры для точек."""
+    back = None
+    with INPUT_LOCK:
+        if spec["point"] is not None:
+            if origin is None:
+                raise RuntimeError("окно игры не найдено — некуда кликать")
+            if return_cursor and IS_WIN:
+                back = cursor_pos()
+            INPUT.mouse_move(origin[0] + spec["point"][0], origin[1] + spec["point"][1])
+            time.sleep(0.02)
+        try:
+            if spec["kind"] == "move":
+                back = None  # «move» и должен оставить курсор там
+                return
+            for i in range(spec["count"]):
+                clicks = 2 if spec["kind"] == "dblclick" else 1
+                for _ in range(clicks):
+                    mouse_click(spec["button"], hold)
+                    if clicks == 2:
+                        time.sleep(0.03)
+                if i + 1 < spec["count"]:
+                    time.sleep(interval)
+        finally:
+            if back is not None:
+                time.sleep(0.02)
+                INPUT.mouse_move(*back)
 
 
 def grab_rgb(sct, left, top, width, height):
@@ -847,6 +1143,11 @@ class App:
         self.running = True
         self.paused = False
         self.pause_reason = None
+        self.input_status = "—"
+        self.input_error = None
+        self.clicker_on = False
+        self.clicker_state = "выкл"
+        self._clicker_dry = [0, 0.0]
         self.vision = {}            # последнее чтение каждой полоски (для окна «Что видит программа»)
         self.target_absent = 0
         self.target_last_hp = None
@@ -966,8 +1267,7 @@ class App:
                     self.register_hotkeys()
 
     def validate_config(self):
-        import pydirectinput
-        mapping = pydirectinput.KEYBOARD_MAPPING
+        mapping = known_keys()
         for sc in self.cfg.get("scenarios", []):
             name = sc.get("name", "?")
             for item in sc.get("actions", []):
@@ -977,6 +1277,8 @@ class App:
                     log.warning("Сценарий «%s»: непонятное действие %r", name, item)
                     continue
                 if key == "wait":
+                    continue
+                if parse_mouse(key):
                     continue
                 real = resolve_key(key, self.cfg.get("skill_keys", {}))
                 if real is None:
@@ -1018,6 +1320,7 @@ class App:
             "stats_reset": self.stats_reset,
             "run_now": self.request_run_now,
             "settings": self.open_settings,
+            "clicker_toggle": self.toggle_clicker,
             "reload": self.reload,
             "pause": self.toggle_pause,
             "exit": self.stop,
@@ -1055,6 +1358,7 @@ class App:
             ("stats_reset", "вывести статистику и обнулить"),
             ("run_now", "проверка: сразу выполнить сценарий «после убийства»"),
             ("settings", "окно настроек"),
+            ("clicker_toggle", "автокликер вкл/выкл"),
             ("pause", "пауза / продолжить (и снять аварийную паузу)"),
             ("reload", "перечитать config.json"),
             ("exit", "выход"),
@@ -1228,6 +1532,110 @@ class App:
         self.manual_request_time = time.time()
         log.info("Проверка: выполню «%s», когда окно игры будет активно и Ctrl/Alt отпущены", name)
 
+    # ---------- ввод ----------
+
+    def setup_input(self):
+        global INPUT
+        with INPUT_LOCK:
+            if INPUT is not None:
+                try:
+                    INPUT.close()
+                except Exception:
+                    pass
+            INPUT, err = make_input(self.cfg.get("input"))
+        self.input_status = INPUT.status
+        self.input_error = err
+        if err:
+            log.warning(err)
+            self.beep("error")
+        else:
+            log.info("Способ ввода: %s", self.input_status)
+        self._input_cfg = copy.deepcopy(self.cfg.get("input"))
+
+    # ---------- автокликер ----------
+
+    def toggle_clicker(self):
+        ck = self.cfg.get("clicker", {})
+        if not ck.get("enabled"):
+            log.info("Автокликер выключен в настройках (вкладка «Кликер и ввод»)")
+            self.beep("error")
+            return
+        if ck.get("mode") == "hold":
+            log.info("Автокликер в режиме «пока зажата %s» — горячая клавиша не нужна", ck.get("hold_key"))
+            return
+        self.clicker_on = not self.clicker_on
+        log.info("Автокликер: %s", "ВКЛ" if self.clicker_on else "выкл")
+        self.beep("resume" if self.clicker_on else "pause")
+
+    def clicker_should_click(self):
+        """Причина, почему сейчас не кликаем, или None — можно кликать."""
+        ck = self.cfg.get("clicker", {})
+        if not ck.get("enabled"):
+            return "выкл в настройках"
+        mode = ck.get("mode", "toggle")
+        if mode == "hold":
+            try:
+                import keyboard
+                if not keyboard.is_pressed(ck.get("hold_key") or "x"):
+                    return f"ждёт зажатия {str(ck.get('hold_key')).upper()}"
+            except Exception:
+                return "нет модуля keyboard"
+        elif not self.clicker_on:
+            return f"выкл ({self.cfg['hotkeys'].get('clicker_toggle', '').upper()})"
+        if mode == "target":
+            r = self.vision.get("target_hp")
+            if not r or r["status"] != "ok" or not r["value"]:
+                return "ждёт живую цель"
+        if self.paused or self.recording or not self.running:
+            return "пауза"
+        if self.executing:
+            return "сценарий"
+        if self.cfg.get("only_when_window_active", True) and not self.window_is_active():
+            return "игра не активна"
+        if ck.get("point") and self.origin is None:
+            return "окно игры не найдено"
+        return None
+
+    def clicker_worker(self):
+        import random
+        next_t = time.perf_counter()
+        while self.running:
+            ck = self.cfg.get("clicker", {})
+            why = self.clicker_should_click()
+            if why:
+                self.clicker_state = why
+                time.sleep(0.02)
+                next_t = time.perf_counter()
+                continue
+            cps = min(50.0, max(0.5, float(ck.get("cps", 10))))
+            jit = min(0.9, max(0.0, float(ck.get("jitter", 15)) / 100))
+            lo, hi = (list(ck.get("hold_ms") or [8, 20]) + [20])[:2]
+            hold = random.uniform(min(lo, hi), max(lo, hi)) / 1000
+            self.clicker_state = f"кликает {cps:g}/с"
+            now = time.perf_counter()
+            if now < next_t:
+                time.sleep(min(0.02, next_t - now))
+                continue
+            button = ck.get("button", "left") if ck.get("button") in MOUSE_BUTTONS else "left"
+            pt = ck.get("point")
+            spec = {"kind": "click", "button": button, "count": 1,
+                    "point": tuple(pt) if pt else None}
+            if self.cfg.get("dry_run"):
+                self._clicker_dry[0] += 1
+                if time.time() - self._clicker_dry[1] > 2:
+                    log.info("  [тест] кликер: кликнул бы %s ×%d", describe_mouse(spec), self._clicker_dry[0])
+                    self._clicker_dry = [0, time.time()]
+            else:
+                try:
+                    perform_mouse(spec, hold, self.origin, return_cursor=False)
+                except Exception as e:
+                    log.warning("Кликер: %s", e)
+                    time.sleep(0.5)
+                self.stats.clicks += 1
+            next_t += (1.0 / cps) * random.uniform(1 - jit, 1 + jit)
+            if next_t < time.perf_counter() - 0.5:
+                next_t = time.perf_counter()  # отстали (пауза, лаг) — не догоняем пачкой
+
     def open_settings(self):
         self.ui_requests.append("settings")
 
@@ -1240,6 +1648,8 @@ class App:
         self.validate_config()
         if self.cfg["hotkeys"] != self._hotkeys_registered:
             self.register_hotkeys()
+        if self.cfg.get("input") != getattr(self, "_input_cfg", None):
+            self.setup_input()
         self.beep("calib")
 
     def wait_modifiers_released(self, timeout=2.0):
@@ -1445,7 +1855,21 @@ class App:
                 if not self.can_continue():
                     ok = False
                     break
-                if key != "wait":
+                mspec = parse_mouse(key)
+                if mspec:
+                    ck = self.cfg.get("clicker", {})
+                    if dry:
+                        log.info("  [тест] мышь: %s, пауза %g c", describe_mouse(mspec), delay)
+                    else:
+                        self.wait_modifiers_released()
+                        try:
+                            perform_mouse(mspec, hold, self.origin,
+                                          interval=1.0 / max(0.5, float(ck.get("cps", 10))),
+                                          return_cursor=bool(ck.get("return_cursor", True)))
+                            log.info("  мышь: %s", describe_mouse(mspec))
+                        except Exception as e:
+                            log.warning("  мышь: %s", e)
+                elif key != "wait":
                     real = resolve_key(key, skill_keys)
                     label = key if real == key else f"{key} ({real})"
                     if real is None:
@@ -1718,6 +2142,8 @@ class App:
             f"Моё HP:  {pct('my_hp')}   MP: {pct('my_mp')}",
             self.stats.short(),
             self.keys_line(),
+            f"Ввод: {self.input_status if not self.input_error else 'SendInput (драйвер не загрузился)'}"
+            + (f"   Кликер: {self.clicker_state}" if self.cfg.get('clicker', {}).get('enabled') else ""),
             f"Калибровка: {BAR_NAMES[BAR_KEYS[self.calib_index]]}",
             f"Последнее: {self.last_action}",
         ])
@@ -1776,7 +2202,8 @@ class Overlay:
         self.buttons = []
         for text, cmd in (("⚙ Настройки", app.open_settings),
                           ("⏸ Пауза", lambda: threading.Thread(target=app.toggle_pause, daemon=True).start()),
-                          ("Тест", lambda: threading.Thread(target=app.toggle_dry_run, daemon=True).start())):
+                          ("Тест", lambda: threading.Thread(target=app.toggle_dry_run, daemon=True).start()),
+                          ("Кликер", lambda: threading.Thread(target=app.toggle_clicker, daemon=True).start())):
             b = tk.Label(self.btns, text=text, font=("Segoe UI", 9), fg="#e6e6e6", bg="#30343c",
                          padx=8, pady=2, cursor="hand2")
             b.pack(side="left", padx=2)
@@ -1879,6 +2306,12 @@ class Overlay:
         self.btns.configure(bg=bg)
         self.buttons[1].config(text="▶ Продолжить" if self.app.paused else "⏸ Пауза")
         self.buttons[2].config(text="Тест: вкл" if self.app.cfg.get("dry_run") else "Тест: выкл")
+        ck = self.app.cfg.get("clicker", {})
+        if ck.get("enabled"):
+            self.buttons[3].pack(side="left", padx=2)
+            self.buttons[3].config(text="Кликер: вкл" if self.app.clicker_on else "Кликер: выкл")
+        else:
+            self.buttons[3].pack_forget()
         if self.frames is not None:
             self._draw_frames()
         now = time.time()
@@ -1917,9 +2350,7 @@ def main():
             return 0
 
     import keyboard
-    import pydirectinput
-    pydirectinput.PAUSE = 0
-    pydirectinput.FAILSAFE = False
+    app.setup_input()
 
     app.register_hotkeys()
     app.print_help()
@@ -1935,6 +2366,7 @@ def main():
         log.info("Аварийная пауза не работает, пока не откалибровано «моё HP».")
 
     threading.Thread(target=app.worker, daemon=True).start()
+    threading.Thread(target=app.clicker_worker, daemon=True).start()
     app.beep("start")
 
     try:

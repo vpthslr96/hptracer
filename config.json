@@ -6,6 +6,9 @@
     "actions": "Список [клавиша, пауза после нажатия в секундах]. Клавиши: f1..f12, 0..9, a..z, esc, enter, space, tab, up/down/left/right. Сочетания через +: \"ctrl+1\". [\"wait\", 1.5] — просто пауза.",
     "skill_keys": "Именованные кнопки панели скиллов. В действиях пишите \"@attack\" вместо \"f1\" — тогда при переносе скилла на другую клавишу достаточно поменять её здесь. Можно добавлять свои имена: \"buff\": \"f5\", \"heal\": \"alt+1\".",
     "no_target_sec": "Условие {\"value\": \"no_target_sec\", \"op\": \">=\", \"than\": 4} — цели нет (или её HP = 0) уже 4 секунды. Нужно для сценария «Поиск цели».",
+    "input": "Способ ввода: sendinput — обычный; interception — через драйвер Interception (нужны установленный драйвер и interception.dll рядом с программой). Если драйвер не загрузится, программа сама вернётся к sendinput.",
+    "clicker": "Автокликер: mode — toggle (вкл/выкл горячей клавишей), hold (пока зажата hold_key), target (включён и цель жива); cps — кликов в секунду; jitter — разброс интервала, %; hold_ms — сколько держать кнопку; point — [x, y] относительно окна игры или null (где курсор).",
+    "mouse_steps": "Шаги мыши в сценариях: \"click:left\", \"click:right@120,340\" (точка в окне игры), \"dblclick:left\", \"click:left*5\" (серия с частотой автокликера), \"move@300,200\".",
     "vision": "Зрение: band — сколько строк пикселей читать (медиана); min_confidence — % согласия с моделью «заливка слева, пусто справа», ниже — значение недостоверно и не используется; min_coverage — % столбцов, похожих на полоску, ниже — полоски нет на экране; kill_if_vanished_below — если полоска цели исчезла, а HP было ниже этого %, считаем убийством; track_moved — искать сдвинутое окно цели; learn_empty — уточнять цвет пустой части на лету.",
     "dry_run": "Тестовый режим: всё распознаётся и пишется в лог, но клавиши не нажимаются.",
     "emergency": "Аварийная пауза: on_death — при смерти (моё HP = 0); hp_drop_percent за hp_drop_seconds — при резком падении HP (0 — выключено). Работает, только если откалибровано моё HP.",
@@ -34,6 +37,24 @@
   "only_when_window_active": true,
   "check_interval": 0.1,
   "min_gap": 0.2,
+  "input": {
+    "backend": "sendinput",
+    "interception_dll": ""
+  },
+  "clicker": {
+    "enabled": false,
+    "mode": "toggle",
+    "button": "left",
+    "cps": 10,
+    "jitter": 15,
+    "hold_ms": [
+      8,
+      20
+    ],
+    "hold_key": "x",
+    "point": null,
+    "return_cursor": true
+  },
   "vision": {
     "band": 3,
     "min_confidence": 90,
@@ -99,6 +120,7 @@
     "stats_reset": "ctrl+alt+8",
     "run_now": "ctrl+alt+t",
     "settings": "ctrl+alt+s",
+    "clicker_toggle": "ctrl+alt+c",
     "reload": "ctrl+alt+9",
     "pause": "ctrl+alt+0",
     "exit": "ctrl+alt+end"

@@ -11,7 +11,6 @@
 
 import copy
 import json
-import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -69,6 +68,7 @@ SKILL_HINTS = {"attack": "Атака", "next_target": "Следующая цел
 
 HOTKEY_LABELS = [
     ("settings", "Окно настроек"),
+    ("clicker_toggle", "Автокликер вкл/выкл"),
     ("pause", "Пауза / продолжить"),
     ("dry_run", "Тестовый режим вкл/выкл"),
     ("run_now", "Проверить «После убийства моба»"),
@@ -161,12 +161,20 @@ def combo_name(mods, keysym):
     return "+".join(order + [main])
 
 
+MOUSE_CHOICES = ["click:left", "click:right", "click:middle", "dblclick:left", "click:left*3"]
+BUTTON_LABELS = [("left", "Левая (ЛКМ)"), ("right", "Правая (ПКМ)"), ("middle", "Средняя (СКМ)")]
+
+
 def check_key(key, skill_keys, mapping):
     """Пустая строка — ок, иначе текст ошибки."""
     if not key:
         return "пустая клавиша"
     if key == "wait":
         return ""
+    if hw.parse_mouse(key):
+        return ""
+    if key.startswith(("click", "dblclick", "move")):
+        return "непонятный шаг мыши (примеры: click:left, click:right@120,340, click:left*5)"
     if key.startswith("@"):
         if not skill_keys.get(key[1:]):
             return f"кнопка {key} не задана на вкладке «Кнопки панели»"
@@ -337,8 +345,10 @@ class SettingsWindow:
         self.tab_keys = ttk.Frame(nb, padding=8)
         self.tab_bars = ttk.Frame(nb, padding=8)
         self.tab_general = ttk.Frame(nb, padding=8)
+        self.tab_clicker = ttk.Frame(nb, padding=8)
         nb.add(self.tab_hunt, text="  Охота  ")
         nb.add(self.tab_keys, text="  Кнопки панели  ")
+        nb.add(self.tab_clicker, text="  Кликер и ввод  ")
         nb.add(self.tab_bars, text="  Полоски  ")
         nb.add(self.tab_general, text="  Общие  ")
         self.nb = nb
@@ -355,6 +365,7 @@ class SettingsWindow:
         self.build_keys_tab()
         self.build_hunt_tab()
         self.build_bars_tab()
+        self.build_clicker_tab()
         self.build_general_tab()
         self.refresh_scen_list(select=0)
         self._tick()
@@ -370,11 +381,7 @@ class SettingsWindow:
         return self._snapshot() != self.saved_snapshot
 
     def mapping(self):
-        try:
-            import pydirectinput
-            return pydirectinput.KEYBOARD_MAPPING
-        except Exception:
-            return {}
+        return hw.known_keys()
 
     def skill_keys(self):
         return self.cfg.setdefault("skill_keys", {})
@@ -382,7 +389,7 @@ class SettingsWindow:
     def key_choices(self):
         sk = self.skill_keys()
         named = [f"@{n}  ({str(k).upper()})" for n, k in sk.items() if k]
-        return named + COMMON_KEYS + ["wait"]
+        return named + COMMON_KEYS + MOUSE_CHOICES + ["wait"]
 
     def validate(self):
         errors = []
@@ -400,6 +407,11 @@ class SettingsWindow:
                     errors.append(f"«{name}», шаг {j + 1}: {err}")
             if s.get("enabled", True) and not s.get("actions"):
                 errors.append(f"«{name}»: включён, но шагов нет")
+        ck = self.cfg.get("clicker", {})
+        if ck.get("enabled") and self.v_point_mode.get() == "point" and not ck.get("point"):
+            errors.append("Автокликер: выбрана «в точке», но точка не задана")
+        if ck.get("enabled") and ck.get("mode") == "hold" and check_key(ck.get("hold_key", ""), {}, mapping):
+            errors.append(f"Автокликер: клавиша зажатия — {check_key(ck.get('hold_key', ''), {}, mapping)}")
         for n, k in self.skill_keys().items():
             if not n or " " in n:
                 errors.append(f"Кнопка панели «{n}»: имя без пробелов, латиницей")
@@ -450,6 +462,7 @@ class SettingsWindow:
         if not self.win.winfo_exists():
             return
         self.update_bars_live()
+        self.update_clicker_live()
         self.win.after(300, self._tick)
 
     # ========================================================
@@ -555,6 +568,7 @@ class SettingsWindow:
         sb.pack(fill="x", pady=(4, 0))
         ttk.Button(sb, text="+ Нажатие", command=lambda: self.step_add(["f1", 0.3])).pack(side="left")
         ttk.Button(sb, text="+ Пауза", command=lambda: self.step_add(["wait", 1.0])).pack(side="left", padx=4)
+        ttk.Button(sb, text="+ Клик", command=lambda: self.step_add(["click:left", 0.2])).pack(side="left")
         self.rec_btn = ttk.Button(sb, text="⏺ Записать с клавиатуры", command=self.toggle_recording)
         self.rec_btn.pack(side="left")
         self.rec_label = ttk.Label(sb, text="", foreground="#a33")
@@ -769,27 +783,71 @@ class SettingsWindow:
             ttk.Combobox(row, textvariable=vk, values=choices, width=18).grid(row=0, column=1, padx=(4, 0))
             ttk.Button(row, text="⌨", width=3,
                        command=lambda vk=vk: key_capture(self.win, vk.set)).grid(row=0, column=2, padx=2)
-            ttk.Spinbox(row, textvariable=vd, from_=0, to=600, increment=0.05, width=6).grid(row=0, column=3, padx=(8, 4))
+            ttk.Button(row, text="◎", width=3,
+                       command=lambda vk=vk: self.pick_point(lambda p, vk=vk: vk.set(self.with_point(vk.get(), p)))
+                       ).grid(row=0, column=3)
+            ttk.Spinbox(row, textvariable=vd, from_=0, to=600, increment=0.05, width=6).grid(row=0, column=4, padx=(8, 4))
             for c, (text, cmd) in enumerate((("▲", lambda i=i: self.step_move(i, -1)),
                                              ("▼", lambda i=i: self.step_move(i, 1)),
-                                             ("✕", lambda i=i: self.step_del(i))), start=4):
+                                             ("✕", lambda i=i: self.step_del(i))), start=5):
                 ttk.Button(row, text=text, width=2, command=cmd).grid(row=0, column=c, padx=1)
-            err = ttk.Label(row, text="", foreground="#a33")
-            err.grid(row=1, column=1, columnspan=6, sticky="w")
+            err = ttk.Label(row, text="", foreground="#a33", wraplength=380, justify="left")
+            err.grid(row=1, column=1, columnspan=7, sticky="w")
 
             def upd(*_, i=i, vk=vk, vd=vd, err=err):
                 k = key_token(vk.get())
                 acts[i] = [k, max(0.0, fnum(vd.get(), 0))]
-                m = self.mapping()
-                e = check_key(k, self.skill_keys(), m) if m else ""
-                err.config(text=("⚠ " + e) if e else "")
+                e = check_key(k, self.skill_keys(), self.mapping())
+                ms = hw.parse_mouse(k)
                 if e:
+                    err.config(text="⚠ " + e, foreground="#a33")
+                elif ms:
+                    err.config(text="мышь: " + hw.describe_mouse(ms)
+                               + ("" if ms["point"] else " — там, где курсор (◎ — выбрать точку)"),
+                               foreground="#555")
+                if e or ms:
                     err.grid()
                 else:
                     err.grid_remove()
             vk.trace_add("write", upd)
             vd.trace_add("write", upd)
             upd()
+
+    # ---------- точки для мыши ----------
+
+    def with_point(self, text, point):
+        """Ставит точку в шаг: мышиный шаг получает @x,y, клавиша превращается в клик ЛКМ в точке."""
+        ms = hw.parse_mouse(key_token(text))
+        if ms is None:
+            ms = {"kind": "click", "button": "left", "count": 1, "point": None}
+        ms["point"] = point
+        return hw.mouse_spec(**ms)
+
+    def countdown(self, label, text, then, n=3):
+        """Обратный отсчёт таймерами окна (без фоновых потоков — tkinter их не любит)."""
+        if not self.win.winfo_exists():
+            return
+        if n > 0:
+            label.config(text=f"{text}… {n}", foreground="#286b2e")
+            self.win.after(1000, lambda: self.countdown(label, text, then, n - 1))
+        else:
+            then()
+
+    def pick_point(self, callback):
+        """Через 3 секунды запоминает позицию курсора относительно окна игры."""
+        def done():
+            origin, _ = self.app.get_origin()
+            if origin is None:
+                self.msg.config(text="Окно игры не найдено — привяжите его на вкладке «Полоски»", foreground="#a33")
+                return
+            x, y = hw.cursor_pos()
+            p = (x - origin[0], y - origin[1])
+            if not (0 <= p[0] < origin[2] and 0 <= p[1] < origin[3]):
+                self.msg.config(text=f"Курсор вне окна игры ({p[0]}, {p[1]}) — попробуйте ещё раз", foreground="#a33")
+                return
+            callback(p)
+            self.msg.config(text=f"Точка ({p[0]}, {p[1]}) в окне игры запомнена", foreground="#286b2e")
+        self.countdown(self.msg, "Наведите курсор на нужное место в игре", done)
 
     def step_add(self, act):
         s = self.current()
@@ -1060,17 +1118,14 @@ class SettingsWindow:
 
     def delayed(self, what):
         def run():
-            for i in (3, 2, 1):
-                self.win.after(0, lambda i=i: self.delay_label.config(text=f"Переключитесь в игру… {i}"))
-                time.sleep(1)
             try:
                 if what == "bind":
                     self.app.bind_window()
                 else:
                     self.app.auto_find()
             finally:
-                self.win.after(0, self.after_calibration)
-        threading.Thread(target=run, daemon=True).start()
+                self.after_calibration()
+        self.countdown(self.delay_label, "Переключитесь в игру", run)
 
     def after_calibration(self):
         if not self.win.winfo_exists():
@@ -1111,6 +1166,164 @@ class SettingsWindow:
                 continue
             w["img"].config(image=photo, width=img.shape[1], height=img.shape[0])
             w["photo"] = photo  # держим ссылку, иначе картинка пропадёт
+
+    # ========================================================
+    #  Вкладка «Кликер и ввод»
+    # ========================================================
+
+    def build_clicker_tab(self):
+        t = self.tab_clicker
+        inp = self.cfg.setdefault("input", copy.deepcopy(hw.DEFAULT_CONFIG["input"]))
+        ck = self.cfg.setdefault("clicker", copy.deepcopy(hw.DEFAULT_CONFIG["clicker"]))
+
+        f = ttk.LabelFrame(t, text="Способ ввода (клавиши сценариев и клики)", padding=(8, 4))
+        f.pack(fill="x")
+        self.v_backend = tk.StringVar(value=inp.get("backend", "sendinput"))
+        ttk.Radiobutton(f, text="SendInput — обычный, ничего ставить не нужно", value="sendinput",
+                        variable=self.v_backend).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Radiobutton(f, text="Драйвер Interception — нажатия от имени настоящих клавиатуры и мыши",
+                        value="interception", variable=self.v_backend).grid(row=1, column=0, columnspan=3, sticky="w")
+        ttk.Label(f, text="interception.dll:").grid(row=2, column=0, sticky="w", padx=(22, 4))
+        self.v_dll = tk.StringVar(value=inp.get("interception_dll", ""))
+        ttk.Entry(f, textvariable=self.v_dll, width=50).grid(row=2, column=1, sticky="w")
+        ttk.Button(f, text="Обзор…", command=self.browse_dll).grid(row=2, column=2, padx=4)
+        ttk.Button(f, text="Проверить драйвер", command=self.check_driver).grid(row=2, column=3)
+        self.input_label = ttk.Label(f, text="", foreground="#286b2e")
+        self.input_label.grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ttk.Label(f, foreground="#555", wraplength=980, justify="left", text=(
+            "Установка драйвера (один раз): скачайте Interception (github.com/oblitum/Interception, Releases), "
+            "в командной строке от имени администратора выполните «command line installer\\install-interception.exe "
+            "/install» и перезагрузите компьютер. Файл library\\x64\\interception.dll положите рядом с HPWatcher.exe "
+            "(или укажите путь выше). Пустое поле — искать рядом с программой. Если драйвер не загрузится, "
+            "программа сама вернётся к SendInput."
+        )).grid(row=4, column=0, columnspan=4, sticky="w", pady=(2, 0))
+
+        f = ttk.LabelFrame(t, text="Автокликер", padding=(8, 4))
+        f.pack(fill="x", pady=8)
+        left = ttk.Frame(f)
+        left.pack(side="left", anchor="n")
+        right = ttk.Frame(f)
+        right.pack(side="left", anchor="n", padx=24)
+
+        self._g_check(left, ["clicker", "enabled"], "Автокликер включён")
+        self.v_mode = tk.StringVar(value=ck.get("mode", "toggle"))
+        hk = self.cfg["hotkeys"].get("clicker_toggle", "").upper()
+        ttk.Label(left, text="Когда кликать:").pack(anchor="w", pady=(6, 0))
+        ttk.Radiobutton(left, text=f"Вкл/выкл горячей клавишей {hk} или кнопкой «Кликер»",
+                        value="toggle", variable=self.v_mode).pack(anchor="w")
+        hold = ttk.Frame(left)
+        hold.pack(anchor="w")
+        ttk.Radiobutton(hold, text="Пока зажата клавиша", value="hold", variable=self.v_mode).pack(side="left")
+        self.v_hold_key = tk.StringVar(value=ck.get("hold_key", "x"))
+        ttk.Entry(hold, textvariable=self.v_hold_key, width=8).pack(side="left", padx=4)
+        ttk.Button(hold, text="⌨", width=3, command=lambda: key_capture(self.win, self.v_hold_key.set)).pack(side="left")
+        ttk.Radiobutton(left, text=f"Пока цель жива (кликер включён {hk})", value="target",
+                        variable=self.v_mode).pack(anchor="w")
+
+        self.v_button = tk.StringVar(value=dict(BUTTON_LABELS).get(ck.get("button", "left"), BUTTON_LABELS[0][1]))
+        row = ttk.Frame(right)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text="Кнопка", width=24).pack(side="left")
+        ttk.Combobox(row, textvariable=self.v_button, values=[l for _, l in BUTTON_LABELS], state="readonly",
+                     width=14).pack(side="left")
+        self._g_number(right, ["clicker", "cps"], "Кликов в секунду", 0.5, 50, 1, "", float, width=24)
+        self._g_number(right, ["clicker", "jitter"], "Разброс интервала", 0, 90, 5, "%", int, width=24)
+        hrow = ttk.Frame(right)
+        hrow.pack(fill="x", pady=2)
+        ttk.Label(hrow, text="Держать кнопку, мс", width=24).pack(side="left")
+        lo, hi = (list(ck.get("hold_ms") or [8, 20]) + [20])[:2]
+        self.v_hold_lo, self.v_hold_hi = tk.StringVar(value=f"{lo:g}"), tk.StringVar(value=f"{hi:g}")
+        ttk.Spinbox(hrow, textvariable=self.v_hold_lo, from_=1, to=500, increment=1, width=5).pack(side="left")
+        ttk.Label(hrow, text="–").pack(side="left", padx=2)
+        ttk.Spinbox(hrow, textvariable=self.v_hold_hi, from_=1, to=500, increment=1, width=5).pack(side="left")
+
+        prow = ttk.Frame(t)
+        prow.pack(fill="x", pady=(0, 6))
+        ttk.Label(prow, text="Куда кликать:").pack(side="left", padx=(8, 8))
+        self.v_point_mode = tk.StringVar(value="point" if ck.get("point") else "cursor")
+        ttk.Radiobutton(prow, text="где курсор", value="cursor", variable=self.v_point_mode,
+                        command=self.clicker_point_changed).pack(side="left")
+        ttk.Radiobutton(prow, text="в точке", value="point", variable=self.v_point_mode,
+                        command=self.clicker_point_changed).pack(side="left", padx=(8, 0))
+        self.point_label = ttk.Label(prow, text="")
+        self.point_label.pack(side="left", padx=(8, 0))
+        ttk.Button(prow, text="Выбрать точку (3 с)", command=lambda: self.pick_point(self.set_clicker_point)
+                   ).pack(side="left", padx=8)
+        self.clicker_point_changed()
+
+        self.clicker_label = ttk.Label(t, text="", foreground="#286b2e")
+        self.clicker_label.pack(anchor="w")
+        self._g_check(t, ["clicker", "return_cursor"],
+                      "После клика в точку из шага сценария возвращать курсор на место")
+        ttk.Label(t, foreground="#555", wraplength=980, justify="left", text=(
+            "Кликер не кликает на паузе, во время записи, пока выполняется сценарий и когда окно игры не активно. "
+            "В тестовом режиме только пишет в лог. Клики мышью можно добавлять и в шаги сценариев на вкладке «Охота»: "
+            "«+ Клик», затем ◎, чтобы выбрать точку в окне игры."
+        )).pack(anchor="w", pady=(6, 0))
+
+    def browse_dll(self):
+        from tkinter import filedialog
+        p = filedialog.askopenfilename(parent=self.win, title="interception.dll",
+                                       filetypes=[("interception.dll", "*.dll"), ("Все файлы", "*.*")])
+        if p:
+            self.v_dll.set(p)
+
+    def check_driver(self):
+        cfg = {"backend": "interception", "interception_dll": self.v_dll.get().strip()}
+        try:
+            b = hw.InterceptionBackend(cfg["interception_dll"] or None)
+            text, color = f"Драйвер работает: {b.status}. Нажмите «Сохранить», чтобы включить.", "#286b2e"
+            b.close()
+        except Exception as e:
+            text, color = f"Драйвер не работает: {e}", "#a33"
+        self.input_label.config(text=text, foreground=color)
+        self._driver_checked = time.time()
+
+    def set_clicker_point(self, p):
+        self.cfg["clicker"]["point"] = [int(p[0]), int(p[1])]
+        self.v_point_mode.set("point")
+        self.clicker_point_changed()
+
+    def clicker_point_changed(self):
+        ck = self.cfg["clicker"]
+        if self.v_point_mode.get() == "cursor":
+            self._saved_point = ck.get("point") or getattr(self, "_saved_point", None)
+            ck["point"] = None
+            self.point_label.config(text="(курсор не двигается)", foreground="#555")
+        else:
+            if not ck.get("point") and getattr(self, "_saved_point", None):
+                ck["point"] = self._saved_point
+            pt = ck.get("point")
+            self.point_label.config(text=f"({pt[0]}, {pt[1]}) в окне игры" if pt else "точка не выбрана",
+                                    foreground="" if pt else "#a33")
+
+    def update_clicker_live(self):
+        if not hasattr(self, "clicker_label"):
+            return
+        app = self.app
+        ck = app.cfg.get("clicker", {})
+        state = app.clicker_state if ck.get("enabled") else "выключен"
+        self.clicker_label.config(text=f"Кликер сейчас: {state}   ·   кликов за сессию: {app.stats.clicks}")
+        if time.time() - getattr(self, "_driver_checked", 0) > 8:
+            err = getattr(app, "input_error", None)
+            self.input_label.config(text=f"Сейчас: {app.input_status}" + (f" — {err}" if err else ""),
+                                    foreground="#a33" if err else "#286b2e")
+
+    def collect_clicker(self):
+        if not hasattr(self, "v_backend"):
+            return
+        inp = self.cfg.setdefault("input", {})
+        inp["backend"] = self.v_backend.get()
+        inp["interception_dll"] = self.v_dll.get().strip()
+        ck = self.cfg.setdefault("clicker", {})
+        ck["mode"] = self.v_mode.get()
+        ck["hold_key"] = key_token(self.v_hold_key.get()) or "x"
+        ck["button"] = {l: k for k, l in BUTTON_LABELS}.get(self.v_button.get(), "left")
+        lo = min(500, max(1, fnum(self.v_hold_lo.get(), 8)))
+        hi = min(500, max(1, fnum(self.v_hold_hi.get(), 20)))
+        ck["hold_ms"] = [int(min(lo, hi)), int(max(lo, hi))]
+        if self.v_point_mode.get() == "cursor":
+            ck["point"] = None
 
     # ========================================================
     #  Вкладка «Общие»
@@ -1204,3 +1417,4 @@ class SettingsWindow:
                 d[path[-1]] = int(round(val)) if typ is int else round(val, 3)
         if hasattr(self, "v_title"):
             self.cfg["window_title"] = self.v_title.get().strip()
+        self.collect_clicker()
