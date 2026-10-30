@@ -24,6 +24,7 @@ import hp_watcher as hw
 
 TRIGGERS = [
     ("kill", "После убийства цели"),
+    ("lost", "Цель потеряна (не убита)"),
     ("combat", "Во время боя (цель жива)"),
     ("no_target", "Нет цели"),
     ("timer", "По таймеру / по условию"),
@@ -32,6 +33,8 @@ TRIGGER_LABEL = dict(TRIGGERS)
 TRIGGER_BY_LABEL = {v: k for k, v in TRIGGERS}
 TRIGGER_HINT = {
     "kill": "Один раз после каждого убийства. Обычно: следующая цель → атака, подобрать дроп.",
+    "lost": "Окно цели закрылось, а HP было заметным: моба перехватили, сняли цель Esc, моб убежал. "
+            "Обычно: следующая цель → атака.",
     "combat": "Пока у цели есть HP, повторяется с указанным интервалом. Для атакующих скиллов.",
     "no_target": "Если цели нет указанное время: next target не нашёл моба, моба перехватили.",
     "timer": "Каждые N секунд, если выполнены доп. условия (или всегда, если условий нет). "
@@ -40,6 +43,7 @@ TRIGGER_HINT = {
 }
 REPEAT_HINT = {
     "kill": "0 — после каждого убийства",
+    "lost": "0 — после каждой потери",
     "combat": "например 5 — скилл раз в 5 с",
     "no_target": "не чаще, чем раз в столько секунд",
     "timer": "1200 = раз в 20 минут",
@@ -101,6 +105,8 @@ def split_conditions(conds):
     for i, c in enumerate(conds):
         if c.get("event") == "target_died":
             return "kill", 0, conds[:i] + conds[i + 1:]
+        if c.get("event") == "target_lost":
+            return "lost", 0, conds[:i] + conds[i + 1:]
     for i, c in enumerate(conds):
         if c.get("value") == "target_hp" and c.get("op") == ">" and float(c.get("than", 0)) == 0:
             return "combat", 0, conds[:i] + conds[i + 1:]
@@ -115,6 +121,8 @@ def split_conditions(conds):
 def build_conditions(trigger, param, extras):
     if trigger == "kill":
         head = [{"event": "target_died"}]
+    elif trigger == "lost":
+        head = [{"event": "target_lost"}]
     elif trigger == "combat":
         head = [{"value": "target_hp", "op": ">", "than": 0}]
     elif trigger == "no_target":
@@ -165,6 +173,49 @@ def check_key(key, skill_keys, mapping):
         key = str(skill_keys[key[1:]]).lower()
     bad = [p for p in key.split("+") if p.strip() not in mapping]
     return f"неизвестная клавиша {', '.join(bad)}" if bad else ""
+
+
+CLS_COLORS = {0: (235, 120, 40), 1: (70, 200, 100), 2: (120, 120, 135)}  # чужое, заливка, пусто
+
+
+def vision_rgb(res, width=640, top_h=12, strip_h=6):
+    """Увеличенная полоса, которую сняла программа, и под ней — как она поняла каждый столбец.
+    Белая черта — найденная граница заливки."""
+    import numpy as np
+    band = np.asarray(res.get("band"))
+    if band.ndim != 3 or band.shape[1] == 0:
+        return None
+    h, n, _ = band.shape
+    sx = max(1, width // n)
+    top = np.repeat(band, max(1, top_h // h), axis=0)
+    cls = np.asarray(res.get("cls", np.zeros(n)), dtype=int)
+    strip = np.array([CLS_COLORS.get(int(c), (0, 0, 0)) for c in cls], dtype=np.uint8)[None, :, :]
+    strip = np.repeat(strip, strip_h, axis=0)
+    gap = np.full((2, n, 3), 30, np.uint8)
+    img = np.concatenate([top.astype(np.uint8), gap, strip], axis=0)
+    img = np.repeat(img, sx, axis=1)
+    if res.get("status") in ("ok", "unsure"):
+        x = min(img.shape[1] - 2, int(res.get("split", 0)) * sx)
+        img[:, max(0, x - 1):x + 1] = 255
+    return img
+
+
+def vision_text(res):
+    if res is None:
+        return "нет данных — игра не найдена или полоска не настроена"
+    st = res.get("status")
+    if st == "ok":
+        return f"{res['value']:.0f}%   ·   достоверно ({res['agree']:.0f}% согласия)"
+    if st == "unsure":
+        return f"НЕДОСТОВЕРНО — согласие {res['agree']:.0f}%, значение не используется"
+    return f"полоски нет на экране (похожих столбцов {res['coverage']:.0f}%)"
+
+
+def png_b64(img):
+    import base64
+    import mss.tools
+    data = mss.tools.to_png(img.tobytes(), (img.shape[1], img.shape[0]))
+    return base64.b64encode(data).decode("ascii")
 
 
 def fnum(v, default=0.0):
@@ -300,6 +351,7 @@ class SettingsWindow:
         ttk.Button(bottom, text="Сохранить и закрыть", command=lambda: self.save(close=True)).pack(side="right", padx=4)
         ttk.Button(bottom, text="Сохранить", command=self.save).pack(side="right")
 
+        self.gvars = []  # (путь, переменная, тип) — поля вкладок «Полоски» и «Общие»
         self.build_keys_tab()
         self.build_hunt_tab()
         self.build_bars_tab()
@@ -517,6 +569,8 @@ class SettingsWindow:
         trig, param, extras = split_conditions(s.get("conditions"))
         if trig == "kill":
             when = "После убийства"
+        elif trig == "lost":
+            when = "Цель потеряна"
         elif trig == "combat":
             when = "В бою"
         elif trig == "no_target":
@@ -918,7 +972,7 @@ class SettingsWindow:
     def build_bars_tab(self):
         t = self.tab_bars
         hk = self.cfg["hotkeys"]
-        top = ttk.LabelFrame(t, text="Окно игры", padding=8)
+        top = ttk.LabelFrame(t, text="Окно игры", padding=(8, 4))
         top.pack(fill="x")
         self.v_title = tk.StringVar(value=self.cfg.get("window_title", ""))
         ttk.Label(top, text="Заголовок содержит:").grid(row=0, column=0, sticky="w")
@@ -927,45 +981,81 @@ class SettingsWindow:
         ttk.Button(top, text="Автопоиск полосок (через 3 с)",
                    command=lambda: self.delayed("auto")).grid(row=0, column=3, padx=6)
         self.delay_label = ttk.Label(top, text="", foreground="#286b2e")
-        self.delay_label.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Label(top, foreground="#555", wraplength=880, justify="left", text=(
-            "Нажмите кнопку и за 3 секунды переключитесь в игру. Для автопоиска возьмите в цель моба "
-            "с полным HP, свои HP и MP тоже должны быть полными."
-        )).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self.delay_label.grid(row=1, column=0, columnspan=4, sticky="w")
+        ttk.Label(top, foreground="#555", wraplength=980, justify="left", text=(
+            "Нажмите кнопку и за 3 с переключитесь в игру. Для автопоиска возьмите моба с полным HP, свои HP/MP "
+            f"тоже полные. Вручную: {hk.get('calib_next_bar', '').upper()} — выбрать полоску, курсор на левый край → "
+            f"{hk.get('calib_left', '').upper()}, на правый → {hk.get('calib_right', '').upper()}."
+        )).grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
-        box = ttk.LabelFrame(t, text="Полоски", padding=8)
-        box.pack(fill="x", pady=8)
-        for c, text in enumerate(("", "Положение", "Цвет", "Сейчас", "Допуск цвета")):
+        box = ttk.LabelFrame(t, text="Полоски", padding=(8, 4))
+        box.pack(fill="x", pady=(6, 0))
+        for c, text in enumerate(("", "Положение", "Заливка / пусто", "Допуск цвета")):
             ttk.Label(box, text=text, foreground="#555").grid(row=0, column=c, sticky="w", padx=6)
         self.bar_widgets = {}
         for r, key in enumerate(hw.BAR_KEYS, start=1):
-            ttk.Label(box, text=hw.BAR_NAMES[key]).grid(row=r, column=0, sticky="w", padx=6, pady=3)
-            pos = ttk.Label(box, text="")
+            ttk.Label(box, text=hw.BAR_NAMES[key], width=10).grid(row=r, column=0, sticky="w", padx=6, pady=1)
+            pos = ttk.Label(box, text="", width=22)
             pos.grid(row=r, column=1, sticky="w", padx=6)
-            sw = tk.Label(box, text="      ", relief="solid", bd=1)
-            sw.grid(row=r, column=2, sticky="w", padx=6)
-            val = ttk.Label(box, text="—", width=8)
-            val.grid(row=r, column=3, sticky="w", padx=6)
+            sws = ttk.Frame(box)
+            sws.grid(row=r, column=2, sticky="w", padx=6)
+            sw = tk.Label(sws, text="     ", relief="solid", bd=1)
+            sw.pack(side="left")
+            sw_e = tk.Label(sws, text="     ", relief="solid", bd=1)
+            sw_e.pack(side="left", padx=(3, 0))
+            tol = ttk.Frame(box)
+            tol.grid(row=r, column=3, sticky="w", padx=6)
             vt = tk.IntVar(value=int(self.cfg["bars"][key].get("tolerance", 60)))
-            sc = ttk.Scale(box, from_=10, to=140, variable=vt, length=220)
-            sc.grid(row=r, column=4, sticky="w", padx=6)
-            tl = ttk.Label(box, text=str(vt.get()), width=4)
-            tl.grid(row=r, column=5, sticky="w")
+            ttk.Scale(tol, from_=10, to=140, variable=vt, length=200).pack(side="left")
+            tl = ttk.Label(tol, text=str(vt.get()), width=4)
+            tl.pack(side="left", padx=4)
 
             def upd(*_, key=key, vt=vt, tl=tl):
                 v = int(float(vt.get()))
                 tl.config(text=str(v))
                 self.cfg["bars"][key]["tolerance"] = v
             vt.trace_add("write", upd)
-            self.bar_widgets[key] = (pos, sw, val)
+            self.bar_widgets[key] = {"pos": pos, "sw": sw, "sw_e": sw_e}
 
-        ttk.Label(t, wraplength=880, justify="left", foreground="#555", text=(
-            f"Ручная калибровка (в игре, мышью): {hk.get('calib_next_bar', '').upper()} выбрать полоску, "
-            f"курсор на левый край → {hk.get('calib_left', '').upper()}, на правый край → "
-            f"{hk.get('calib_right', '').upper()}. Целиться в верхнюю часть полоски, выше цифр.\n"
-            "Допуск цвета: больше — надёжнее при эффектах и подсветке, но выше риск принять фон за полоску. "
-            "Если HP живого моба показывает 0 — увеличьте; если пустая полоска показывает проценты — уменьшите. "
-            "Значения «Сейчас» обновляются вживую."
+        seen = ttk.LabelFrame(t, text="Что видит программа (вживую)", padding=(8, 4))
+        seen.pack(fill="x", pady=6)
+        legend = ttk.Frame(seen)
+        legend.pack(fill="x", pady=(0, 4))
+        ttk.Label(legend, text="Сверху — снятые пиксели (увеличено), снизу — как поняты столбцы:",
+                  foreground="#555").pack(side="left")
+        for cls, text in ((1, "заливка"), (2, "пусто"), (0, "чужое")):
+            r_, g_, b_ = CLS_COLORS[cls]
+            tk.Label(legend, text="   ", bg=f"#{r_:02x}{g_:02x}{b_:02x}").pack(side="left", padx=(6, 2))
+            ttk.Label(legend, text=text, foreground="#555").pack(side="left")
+        ttk.Label(legend, text="  │ белая черта — граница", foreground="#555").pack(side="left")
+        for key in hw.BAR_KEYS:
+            row = ttk.Frame(seen)
+            row.pack(fill="x", pady=1)
+            ttk.Label(row, text=hw.BAR_NAMES[key], width=10).pack(side="left", anchor="n")
+            right = ttk.Frame(row)
+            right.pack(side="left", fill="x", expand=True)
+            img = tk.Label(right, bg="#202226", width=80, height=1, anchor="w")
+            img.pack(anchor="w")
+            txt = ttk.Label(right, text="—")
+            txt.pack(anchor="w")
+            self.bar_widgets[key].update(img=img, txt=txt, photo=None)
+
+        vbox = ttk.LabelFrame(t, text="Зрение", padding=(8, 4))
+        vbox.pack(fill="x")
+        c1, c2, c3 = ttk.Frame(vbox), ttk.Frame(vbox), ttk.Frame(vbox)
+        c1.pack(side="left", anchor="n")
+        c2.pack(side="left", anchor="n", padx=16)
+        c3.pack(side="left", anchor="n", fill="x", expand=True)
+        self._g_number(c1, ["vision", "band"], "Строк пикселей (медиана)", 1, 9, 2, "", int, width=24)
+        self._g_number(c1, ["vision", "min_confidence"], "Мин. достоверность", 50, 100, 1, "%", int, width=24)
+        self._g_number(c2, ["vision", "kill_if_vanished_below"], "Окно закрылось ниже — убийство",
+                       0, 100, 1, "%", int, width=30)
+        self._g_check(c2, ["vision", "track_moved"], "Находить сдвинутое окно цели")
+        self._g_check(c1, ["vision", "learn_empty"], "Уточнять цвет пустоты на лету")
+        ttk.Label(c3, wraplength=240, justify="left", foreground="#555", text=(
+            "Много оранжевого на чистой полоске — увеличьте допуск цвета. Пустое окно цели или фон "
+            "рядом читаются как полоска — уменьшите. «Недостоверно» — картинка противоречивая, "
+            "по ней программа ничего не делает."
         )).pack(anchor="w")
 
     def delayed(self, what):
@@ -994,25 +1084,61 @@ class SettingsWindow:
 
     def update_bars_live(self):
         bars = self.app.cfg["bars"]
-        for key, (pos, sw, val) in self.bar_widgets.items():
+        vision = getattr(self.app, "vision", {}) or {}
+        for key, w in self.bar_widgets.items():
             b = bars.get(key, {})
             if hw.bar_ready(b):
-                pos.config(text=f"x {b['x1']}…{b['x2']}, y {b['y']}", foreground="")
-                r, g, bl = (int(c) for c in b.get("color", [0, 0, 0]))
-                sw.config(bg=f"#{r:02x}{g:02x}{bl:02x}")
+                w["pos"].config(text=f"x {b['x1']}…{b['x2']}, y {b['y']}", foreground="")
+                fill = b.get("color", [0, 0, 0])
+                empty = b.get("empty_color") or hw.default_empty(fill)
+                w["sw"].config(bg="#%02x%02x%02x" % tuple(int(c) for c in fill))
+                w["sw_e"].config(bg="#%02x%02x%02x" % tuple(int(c) for c in empty))
             else:
-                pos.config(text="не настроена", foreground="#a33")
-                sw.config(bg=self.win.cget("bg"))
-            v = self.app.values.get(key)
-            val.config(text="—" if v is None else f"{v:.0f}%")
+                w["pos"].config(text="не настроена", foreground="#a33")
+                w["sw"].config(bg=self.win.cget("bg"))
+                w["sw_e"].config(bg=self.win.cget("bg"))
+            res = vision.get(key)
+            w["txt"].config(text=vision_text(res) if hw.bar_ready(b) else "сначала настройте полоску",
+                            foreground={"ok": "#286b2e", "unsure": "#a33"}.get((res or {}).get("status"), "#555"))
+            img = vision_rgb(res) if res else None
+            if img is None:
+                w["img"].config(image="", width=80, height=1)
+                w["photo"] = None
+                continue
+            try:
+                photo = tk.PhotoImage(data=png_b64(img))
+            except Exception:
+                continue
+            w["img"].config(image=photo, width=img.shape[1], height=img.shape[0])
+            w["photo"] = photo  # держим ссылку, иначе картинка пропадёт
 
     # ========================================================
     #  Вкладка «Общие»
     # ========================================================
 
+    def _g_get(self, path):
+        d = self.cfg
+        for p in path[:-1]:
+            d = d.setdefault(p, {})
+        return d.get(path[-1])
+
+    def _g_check(self, parent, path, text):
+        v = tk.BooleanVar(value=bool(self._g_get(path)))
+        ttk.Checkbutton(parent, text=text, variable=v).pack(anchor="w", pady=2)
+        self.gvars.append((path, v, bool))
+
+    def _g_number(self, parent, path, text, lo, hi, step, unit="", kind=float, width=34):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text=text, width=width).pack(side="left")
+        cur = self._g_get(path)
+        v = tk.StringVar(value=f"{cur:g}" if cur is not None else "")
+        ttk.Spinbox(row, textvariable=v, from_=lo, to=hi, increment=step, width=7).pack(side="left")
+        ttk.Label(row, text=unit, foreground="#555").pack(side="left", padx=4)
+        self.gvars.append((path, v, (kind, lo, hi)))
+
     def build_general_tab(self):
         t = self.tab_general
-        self.gvars = []  # (путь, переменная, тип)
         cols = ttk.Frame(t)
         cols.pack(fill="both", expand=True)
         left = ttk.Frame(cols)
@@ -1020,25 +1146,7 @@ class SettingsWindow:
         right = ttk.Frame(cols)
         right.pack(side="left", fill="both", expand=True)
 
-        def get(path):
-            d = self.cfg
-            for p in path[:-1]:
-                d = d.setdefault(p, {})
-            return d.get(path[-1])
-
-        def check(parent, path, text):
-            v = tk.BooleanVar(value=bool(get(path)))
-            ttk.Checkbutton(parent, text=text, variable=v).pack(anchor="w", pady=2)
-            self.gvars.append((path, v, bool))
-
-        def number(parent, path, text, lo, hi, step, unit="", kind=float):
-            row = ttk.Frame(parent)
-            row.pack(fill="x", pady=2)
-            ttk.Label(row, text=text, width=34).pack(side="left")
-            v = tk.StringVar(value=f"{get(path):g}" if get(path) is not None else "")
-            ttk.Spinbox(row, textvariable=v, from_=lo, to=hi, increment=step, width=8).pack(side="left")
-            ttk.Label(row, text=unit, foreground="#555").pack(side="left", padx=4)
-            self.gvars.append((path, v, (kind, lo, hi)))
+        check, number = self._g_check, self._g_number
 
         f = ttk.LabelFrame(left, text="Работа", padding=8)
         f.pack(fill="x")

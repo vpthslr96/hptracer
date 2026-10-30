@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HP Watcher v2.3 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
+HP Watcher v2.4 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
 нажатий клавиш по условиям. Все настройки — в config.json рядом со скриптом.
 Инструкция — в README.md.
 """
@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler
 
 import numpy as np
 
-VERSION = "2.3"
+VERSION = "2.4"
 IS_WIN = sys.platform == "win32"
 
 if IS_WIN:
@@ -68,7 +68,7 @@ BAR_NAMES = {"target_hp": "HP цели", "my_hp": "моё HP", "my_mp": "моё 
 VALUE_KEYS = BAR_KEYS + ["no_target_sec"]
 MIN_REPEAT = 0.3  # сценарий без события не повторяется чаще, чем раз в столько секунд
 OVERLAY_COLORS = {"target_hp": "#ffd400", "my_hp": "#3cff6a", "my_mp": "#38d6ff"}
-EVENTS = {"target_died"}
+EVENTS = {"target_died", "target_lost"}
 OPS = {"<": operator.lt, "<=": operator.le, ">": operator.gt,
        ">=": operator.ge, "==": operator.eq, "!=": operator.ne}
 MODIFIERS = {"ctrl", "alt", "shift", "win", "ctrlleft", "ctrlright", "altleft",
@@ -108,6 +108,11 @@ DEFAULT_CONFIG = {
                       "Можно добавлять свои имена: \"buff\": \"f5\", \"heal\": \"alt+1\".",
         "no_target_sec": "Условие {\"value\": \"no_target_sec\", \"op\": \">=\", \"than\": 4} — цели нет "
                          "(или её HP = 0) уже 4 секунды. Нужно для сценария «Поиск цели».",
+        "vision": "Зрение: band — сколько строк пикселей читать (медиана); min_confidence — % согласия "
+                  "с моделью «заливка слева, пусто справа», ниже — значение недостоверно и не используется; "
+                  "min_coverage — % столбцов, похожих на полоску, ниже — полоски нет на экране; "
+                  "kill_if_vanished_below — если полоска цели исчезла, а HP было ниже этого %, считаем убийством; "
+                  "track_moved — искать сдвинутое окно цели; learn_empty — уточнять цвет пустой части на лету.",
         "dry_run": "Тестовый режим: всё распознаётся и пишется в лог, но клавиши не нажимаются.",
         "emergency": "Аварийная пауза: on_death — при смерти (моё HP = 0); hp_drop_percent за hp_drop_seconds — "
                      "при резком падении HP (0 — выключено). Работает, только если откалибровано моё HP.",
@@ -137,6 +142,14 @@ DEFAULT_CONFIG = {
     "only_when_window_active": True,
     "check_interval": 0.1,
     "min_gap": 0.2,
+    "vision": {
+        "band": 3,
+        "min_confidence": 90,
+        "min_coverage": 50,
+        "kill_if_vanished_below": 15,
+        "track_moved": True,
+        "learn_empty": True,
+    },
     "dead_confirm": 3,
     "event_ttl": 3.0,
     "key_hold": 0.05,
@@ -175,6 +188,14 @@ DEFAULT_CONFIG = {
             "priority": 10,
             "cooldown": 0,
             "conditions": [{"event": "target_died"}],
+            "actions": [["@next_target", 0.4], ["@attack", 0.3]],
+        },
+        {
+            "name": "После потери цели",
+            "enabled": True,
+            "priority": 15,
+            "cooldown": 0,
+            "conditions": [{"event": "target_lost"}],
             "actions": [["@next_target", 0.4], ["@attack", 0.3]],
         },
         {
@@ -266,6 +287,153 @@ def fill_percent(mask, min_run=2):
     if runs.size == 0:
         return 0.0
     return min(100.0, (runs[-1] + min_run) / n * 100.0)
+
+
+# ---------- Зрение v2: полоса пикселей, два цвета, оптимальная граница, самопроверка ----------
+
+OTHER, FILL, EMPTY = 0, 1, 2
+UNIFORM_STD = 14   # заливка и пустота полоски однородны; пёстрый фон — нет
+
+
+def default_empty(fill):
+    """Цвет пустой части, пока он не известен точно: тёмный вариант заливки."""
+    return [int(c * 0.25) for c in fill]
+
+
+def column_colors(band):
+    """band: (строки, столбцы, 3) -> (столбцы, 3). Медиана по строкам гасит цифры и рамку."""
+    band = np.asarray(band)
+    if band.ndim == 2:
+        return band.astype(np.int16)
+    return np.median(band, axis=0).astype(np.int16)
+
+
+def classify(cols, fill, empty, tol):
+    """Каждый столбец: FILL — похож на заливку, EMPTY — на пустую часть, OTHER — ни на что."""
+    c = np.asarray(cols, dtype=np.int16)
+    df = np.abs(c - np.asarray(fill, dtype=np.int16)).max(axis=-1)
+    de = np.abs(c - np.asarray(empty, dtype=np.int16)).max(axis=-1)
+    tol_e = min(tol, 25)  # пустая часть тёмная — с тёмным фоном мира путать нельзя, допуск строже
+    cls = np.full(len(c), OTHER, dtype=np.int8)
+    cls[(df <= tol) & (df <= de)] = FILL
+    cls[(de <= tol_e) & (de < df)] = EMPTY
+    return cls
+
+
+def analyze_bar(cols, cls, min_confidence=90, min_coverage=50):
+    """Самопроверка и процент.
+    status: ok — похоже на полоску, значение достоверно;
+            unsure — что-то похожее, но не сходится с моделью (окно перекрыто, эффекты);
+            absent — полоски на экране нет (окно цели закрыто).
+    value: % заполнения — граница, лучше всего делящая столбцы на «заливка слева / пусто справа»."""
+    cls = np.array(cls, dtype=np.int8)
+    cols = np.asarray(cols, dtype=np.int16)
+    n = len(cls)
+    out = {"status": "absent", "value": None, "agree": 0.0, "coverage": 0.0, "split": 0, "cls": cls}
+    if n == 0:
+        return out
+    for kind in (FILL, EMPTY):
+        m = cls == kind
+        if m.sum() >= 4 and cols[m].std(axis=0).max() > UNIFORM_STD:
+            cls[m] = OTHER  # пёстро — это не полоска, а фон
+    # Цвет пустой части ещё не выучен? Если заливка начинается у левого края, а правее неё
+    # однородный участок — это и есть пустая часть.
+    fi = np.flatnonzero(cls == FILL)
+    if fi.size and fi[0] <= max(2, n // 50):
+        tail = slice(fi[-1] + 1, n)
+        t_cols, t_cls = cols[tail], cls[tail]
+        if len(t_cls) >= 3:
+            med = np.median(t_cols, axis=0)
+            near = np.abs(t_cols - med).max(axis=-1) <= 12
+            if near.mean() >= 0.8:
+                t_cls[(t_cls == OTHER) & near] = EMPTY
+                cls[tail] = t_cls
+    f, e = cls == FILL, cls == EMPTY
+    cov = (f.sum() + e.sum()) / n
+    out["coverage"] = round(cov * 100, 1)
+    if cov * 100 < min_coverage:
+        return out
+    pf = np.concatenate(([0], np.cumsum(f)))
+    pe = np.concatenate(([0], np.cumsum(e)))
+    correct = pf + (e.sum() - pe)
+    wrong = pe + (f.sum() - pf)
+    k = int(np.argmax(correct - wrong))
+    agree = correct[k] / max(1, correct[k] + wrong[k])
+    out.update(agree=round(float(agree) * 100, 1), split=k)
+    if agree * 100 < min_confidence:
+        out["status"] = "unsure"
+        return out
+    out.update(status="ok", value=round(k / n * 100, 1))
+    return out
+
+
+def learn_empty(cols, res, old, rate=0.15):
+    """Уточняет цвет пустой части по уверенному чтению. Возвращает новый цвет или None."""
+    if res["status"] != "ok" or res["agree"] < 97:
+        return None
+    m = res["cls"] == EMPTY
+    if m.sum() < max(5, len(m) // 10):
+        return None
+    seen = np.median(np.asarray(cols)[m], axis=0)
+    new = np.asarray(old, dtype=float) * (1 - rate) + seen * rate
+    return [int(round(v)) for v in new]
+
+
+def bar_colors(line, tol):
+    """Цвета заливки и пустоты по строке при калибровке: заливка — левая четверть,
+    пустота — правые 10%, если они заметно отличаются и однородны; иначе — тёмная заливка."""
+    line = np.asarray(line, dtype=np.int16)
+    fill = median_color(line)
+    tail = line[-max(3, len(line) // 10):]
+    tail_c = np.median(tail, axis=0)
+    if (np.abs(tail_c - fill).max() > tol and tail.std(axis=0).max() <= UNIFORM_STD):
+        return fill, [int(v) for v in tail_c]
+    return fill, default_empty(fill)
+
+
+def band_box(bar, band):
+    """Прямоугольник (x, y, w, h) полосы относительно окна игры."""
+    h = max(1, int(band))
+    return bar["x1"], bar["y"] - (h - 1) // 2, bar["x2"] - bar["x1"] + 1, h
+
+
+def read_bar_band(rgb_band, bar, vis):
+    cols = column_colors(rgb_band)
+    fill = bar.get("color", [180, 40, 40])
+    empty = bar.get("empty_color") or default_empty(fill)
+    cls = classify(cols, fill, empty, int(bar.get("tolerance", 60)))
+    res = analyze_bar(cols, cls, float(vis.get("min_confidence", 90)), float(vis.get("min_coverage", 50)))
+    res["cols"] = cols
+    return res
+
+
+def find_moved_bar(region, bar, n, min_share=0.9):
+    """Ищет в region (h, w, 3) горизонтальный отрезок длиной n, похожий на полоску
+    (заливка/пустота с границами по краям). Возвращает список (x, y) в координатах region."""
+    fill = bar.get("color", [180, 40, 40])
+    empty = bar.get("empty_color") or default_empty(fill)
+    tol = int(bar.get("tolerance", 60))
+    h, w, _ = region.shape
+    if w < n + 2:
+        return []
+    found = []
+    kernel = np.ones(n, dtype=np.int32)
+    for y in range(h):
+        row = region[y].astype(np.int16)
+        cls = classify(row, fill, empty, tol)
+        good = (cls != OTHER).astype(np.int32)
+        share = np.convolve(good, kernel, "valid")  # share[x] = сколько «своих» в [x, x+n)
+        for x in np.flatnonzero(share >= n * min_share):
+            if x == 0 or x + n >= w:
+                continue
+            if good[x - 1] or good[x + n]:
+                continue  # отрезок должен быть ограничен рамкой, а не частью длинного красного
+            if cls[x] != FILL and cls[x] != EMPTY:
+                continue
+            res = analyze_bar(row[x:x + n], cls[x:x + n].copy(), 95, 80)
+            if res["status"] == "ok":
+                found.append((int(x), int(y)))
+    return found
 
 
 def median_color(line):
@@ -399,6 +567,7 @@ class Stats:
         self.started = time.time()
         self.active = 0.0
         self.kills = 0
+        self.lost = 0
         self.emergencies = 0
         self.scenarios = {}
 
@@ -409,6 +578,8 @@ class Stats:
         ph = self.per_hour()
         rate = f"{ph:.0f}/ч" if ph is not None else "—/ч"
         text = f"Убийств: {self.kills} ({rate})  время {fmt_dur(self.active)}"
+        if self.lost:
+            text += f"  потеряно: {self.lost}"
         if self.emergencies:
             text += f"  аварий: {self.emergencies}"
         return text
@@ -416,6 +587,8 @@ class Stats:
     def summary(self):
         lines = [f"Сессия: всего {fmt_dur(time.time() - self.started)}, активно {fmt_dur(self.active)}",
                  f"Убийств: {self.kills}"]
+        if self.lost:
+            lines.append(f"Потеряно целей (не убиты): {self.lost}")
         ph = self.per_hour()
         if ph is not None:
             lines.append(f"В час: {ph:.1f}, в среднем {self.active / max(1, self.kills):.1f} c на моба")
@@ -649,10 +822,14 @@ def grab_rgb(sct, left, top, width, height):
     return arr[:, :, 2::-1]  # BGRA -> RGB
 
 
-def read_bar(sct, ox, oy, bar):
-    width = bar["x2"] - bar["x1"] + 1
-    line = grab_rgb(sct, ox + bar["x1"], oy + bar["y"], width, 1)[0]
-    return fill_percent(match_mask(line, bar["color"], bar.get("tolerance", 60)))
+def read_bar(sct, ox, oy, bar, vis=None):
+    """Снимает полосу пикселей под полоской и возвращает результат analyze_bar (+ band, cols)."""
+    vis = vis or DEFAULT_CONFIG["vision"]
+    x, y, w, h = band_box(bar, vis.get("band", 3))
+    band = grab_rgb(sct, ox + x, oy + y, w, h)
+    res = read_bar_band(band, bar, vis)
+    res["band"] = np.array(band)
+    return res
 
 
 # ============================================================
@@ -670,6 +847,11 @@ class App:
         self.running = True
         self.paused = False
         self.pause_reason = None
+        self.vision = {}            # последнее чтение каждой полоски (для окна «Что видит программа»)
+        self.target_absent = 0
+        self.target_last_hp = None
+        self._track = {"last": 0.0, "cand": None, "hits": 0}
+        self._learn_dirty = 0.0
         self.manual_request = None
         self.manual_request_time = 0.0
         self.last_scenario_end = 0.0
@@ -741,9 +923,17 @@ class App:
             changed = True
             cur = by_name.get(d["name"])
             if cur is None:
-                scs.append(copy.deepcopy(d))
+                new = copy.deepcopy(d)
+                sk = self.cfg.get("skill_keys", {})
+                missing = sorted({parse_action(a)[0] for a in new.get("actions", [])
+                                  if parse_action(a)[0].startswith("@") and not sk.get(parse_action(a)[0][1:])})
+                if missing and new.get("enabled", True):
+                    new["enabled"] = False
+                    log.info("Сценарий «%s» добавлен выключенным: нет кнопок %s — задайте их в настройках",
+                             d["name"], ", ".join(missing))
+                scs.append(new)
                 log.info("В config.json добавлен сценарий «%s» (%s)", d["name"],
-                         "включён" if d.get("enabled", True) else "выключен")
+                         "включён" if new.get("enabled", True) else "выключен")
             elif not cur.get("actions") and d.get("actions"):
                 cur["actions"] = copy.deepcopy(d["actions"])
                 log.info("Сценарий «%s»: добавлены действия по умолчанию %s", d["name"], d["actions"])
@@ -960,7 +1150,7 @@ class App:
             with mss.mss() as sct:
                 line = grab_rgb(sct, origin[0] + bar["x1"], origin[1] + bar["y"],
                                 bar["x2"] - bar["x1"] + 1, 1)[0]
-            bar["color"] = median_color(line)
+            bar["color"], bar["empty_color"] = bar_colors(line, int(bar.get("tolerance", 60)))
             self.save_config()
         log.info("[%s] правый край: x=%d, ширина %d px, цвет полоски %s. "
                  "Полоска при калибровке должна быть заполнена хотя бы на треть.",
@@ -987,7 +1177,8 @@ class App:
                     log.warning("Автопоиск: %s не найдено", BAR_NAMES[key])
                     continue
                 y, x1, x2, color = res
-                self.cfg["bars"][key].update(x1=x1, x2=x2, y=y, color=color)
+                self.cfg["bars"][key].update(x1=x1, x2=x2, y=y, color=color,
+                                             empty_color=default_empty(color))
                 ok += 1
                 log.info("Автопоиск: %s — x %d…%d, y %d, цвет %s",
                          BAR_NAMES[key], x1, x2, y, tuple(color))
@@ -1300,47 +1491,76 @@ class App:
             self.values = {}
             return
         ox, oy, _, _ = origin
-        vals = {}
+        vis = cfg.get("vision", DEFAULT_CONFIG["vision"])
+        vals, seen = {}, {}
         for key in BAR_KEYS:
             bar = cfg["bars"].get(key)
-            if bar_ready(bar):
-                try:
-                    vals[key] = read_bar(self._sct, ox, oy, bar)
-                except Exception:
-                    pass  # полоска за пределами экрана
+            if not bar_ready(bar):
+                continue
+            try:
+                res = read_bar(self._sct, ox, oy, bar, vis)
+            except Exception:
+                continue  # полоска за пределами экрана
+            seen[key] = res
+            if res["status"] == "ok":
+                vals[key] = res["value"]  # недостоверное и отсутствующее в условия не попадает
+                if vis.get("learn_empty", True):
+                    new = learn_empty(res["cols"], res, bar.get("empty_color") or default_empty(bar["color"]))
+                    if new and new != bar.get("empty_color"):
+                        bar["empty_color"] = new
+                        self._learn_dirty = self._learn_dirty or now
+        self.vision = seen
+        if self._learn_dirty and now - self._learn_dirty > 30:
+            self._learn_dirty = 0.0
+            self.save_config()  # выученный цвет пустоты переживёт перезапуск
+
+        tres = seen.get("target_hp")
+        tstat = tres["status"] if tres else None
         t = vals.get("target_hp")
-        if bar_ready(cfg["bars"].get("target_hp")):
-            if t is None or t <= 0:
+        if bar_ready(cfg["bars"].get("target_hp")) and tstat is not None:
+            if tstat == "ok" and t > 0:
+                self.no_target_since = None
+                vals["no_target_sec"] = 0.0
+            elif tstat in ("ok", "absent"):
                 if self.no_target_since is None:
                     self.no_target_since = now
                 vals["no_target_sec"] = now - self.no_target_since
-            else:
-                self.no_target_since = None
-                vals["no_target_sec"] = 0.0
+            elif self.no_target_since is not None:  # unsure — не знаем, продолжаем отсчёт
+                vals["no_target_sec"] = now - self.no_target_since
         self.values = vals
+        if tstat == "absent" and vis.get("track_moved", True):
+            self.track_target_bar(ox, oy, origin, now)
+        elif tstat == "ok":
+            self._track.update(cand=None, hits=0)
 
         if active and not self.paused and not self.recording and dt < 2:
             self.stats.active += dt
 
-        if t is not None:
+        confirm = int(cfg["dead_confirm"])
+        if tstat == "ok":
+            self.target_absent = 0
             if t > 0:
                 self.target_alive = True
                 self.zero_count = 0
+                self.target_last_hp = t
             else:
                 self.zero_count += 1
-                if self.target_alive and self.zero_count >= int(cfg["dead_confirm"]):
-                    self.target_alive = False
-                    # на паузе убийство считаем, но сценарий по нему потом не запускаем
-                    if not self.paused and not self.recording:
-                        self.events["target_died"] = now
-                    self.stats.kills += 1
-                    log.info("Цель убита (#%d)", self.stats.kills)
-                    if cfg["screenshots"].get("on_kill", False):
-                        self.screenshot(f"убийство {self.stats.kills}")
+                if self.target_alive and self.zero_count >= confirm:
+                    self.on_target_killed("HP 0, окно цели на месте")
+        elif tstat == "absent":
+            self.zero_count = 0
+            self.target_absent += 1
+            if self.target_alive and self.target_absent >= confirm:
+                last = self.target_last_hp if self.target_last_hp is not None else 100
+                if last < float(vis.get("kill_if_vanished_below", 15)):
+                    self.on_target_killed(f"окно цели закрылось на {last:.0f}%")
+                else:
+                    self.on_target_lost(last)
+        # unsure — ничего не решаем, ждём ясной картинки
         ttl = float(cfg["event_ttl"])
         self.events = {k: v for k, v in self.events.items() if now - v <= ttl}
 
-        # Аварийный детектор — только когда игра на экране, иначе читается чужое окно
+        # Аварийный детектор — только когда игра на экране и чтение достоверно
         hp = vals.get("my_hp")
         if hp is not None and active and not self.paused:
             em = cfg["emergency"]
@@ -1353,6 +1573,78 @@ class App:
             )
             if reason:
                 self.emergency_stop(reason)
+
+    def on_target_killed(self, how):
+        self.target_alive = False
+        self.target_last_hp = None
+        # на паузе убийство считаем, но сценарий по нему потом не запускаем
+        if not self.paused and not self.recording:
+            self.events["target_died"] = time.time()
+        self.stats.kills += 1
+        log.info("Цель убита (#%d) — %s", self.stats.kills, how)
+        if self.cfg["screenshots"].get("on_kill", False):
+            self.screenshot(f"убийство {self.stats.kills}")
+
+    def on_target_lost(self, last):
+        self.target_alive = False
+        self.target_last_hp = None
+        if not self.paused and not self.recording:
+            self.events["target_lost"] = time.time()
+        self.stats.lost += 1
+        log.info("Цель потеряна, не убита (HP было %.0f%%) — моба перехватили, сняли цель или он убежал", last)
+        if self.cfg["screenshots"].get("on_kill", False):
+            self.screenshot("цель потеряна")
+
+    def track_target_bar(self, ox, oy, origin, now):
+        """Окно цели могли передвинуть: ищем полоску той же длины рядом с прежним местом.
+        Новое место принимаем, только если нашли его 2 раза подряд в одной точке."""
+        tr = self._track
+        if now - tr["last"] < 1.0:
+            return
+        tr["last"] = now
+        bar = self.cfg["bars"]["target_hp"]
+        n = bar["x2"] - bar["x1"] + 1
+        rx, ry = 160, 100
+        _, _, ww, wh = origin
+        x0, y0 = max(0, bar["x1"] - rx), max(0, bar["y"] - ry)
+        x1, y1 = min(ww, bar["x2"] + rx + 1), min(wh, bar["y"] + ry + 1)
+        if x1 - x0 < n + 2 or y1 <= y0:
+            return
+        try:
+            region = grab_rgb(self._sct, ox + x0, oy + y0, x1 - x0, y1 - y0)
+        except Exception:
+            return
+        others = [self.cfg["bars"][k] for k in BAR_KEYS if k != "target_hp" and bar_ready(self.cfg["bars"][k])]
+        cands = []
+        for (x, y) in find_moved_bar(region, bar, n):
+            ax, ay = x + x0, y + y0
+            if any(abs(ay - o["y"]) <= 6 and ax <= o["x2"] + 6 and ax + n >= o["x1"] - 6 for o in others):
+                continue  # это наша собственная полоска HP/MP
+            if abs(ax - bar["x1"]) <= 1 and abs(ay - bar["y"]) <= 1:
+                continue
+            cands.append((ax, ay))
+        if not cands:
+            tr.update(cand=None, hits=0)
+            return
+        # полоска обычно 2–6 строк: берём точку посередине группы
+        cands.sort(key=lambda c: (abs(c[0] - bar["x1"]) + abs(c[1] - bar["y"])))
+        ax = cands[0][0]
+        ys = sorted(c[1] for c in cands if c[0] == ax)
+        best = (ax, ys[len(ys) // 3])
+        if tr["cand"] and abs(tr["cand"][0] - best[0]) <= 1 and abs(tr["cand"][1] - best[1]) <= 2:
+            tr["hits"] += 1
+        else:
+            tr.update(cand=best, hits=1)
+        if tr["hits"] >= 2:
+            dx, dy = best[0] - bar["x1"], best[1] - bar["y"]
+            with self.lock:
+                bar["x1"] += dx
+                bar["x2"] += dx
+                bar["y"] += dy
+                self.save_config()
+            tr.update(cand=None, hits=0)
+            log.info("Окно цели сдвинуто на (%+d, %+d) — полоска найдена на новом месте", dx, dy)
+            self.beep("calib")
 
     def tick(self):
         self.poll(force=True)
@@ -1409,8 +1701,14 @@ class App:
             win = "игра не активна, жду"
 
         def pct(k):
-            v = self.values.get(k)
-            return "  —" if v is None else f"{v:3.0f}%"
+            r = self.vision.get(k)
+            if r is None:
+                return "  —"
+            if r["status"] == "absent":
+                return " нет"
+            if r["status"] == "unsure":
+                return "  ? "
+            return f"{r['value']:3.0f}%"
 
         test = "  [ТЕСТ]" if self.cfg.get("dry_run") else ""
         return "\n".join([
@@ -1552,8 +1850,15 @@ class Overlay:
             width = 2 if key == current else 1
             # рамка не задевает саму считываемую линию (y)
             c.create_rectangle(x1 - 5, y - 5, x2 + 5, y + 5, outline=color, width=width)
-            v = app.values.get(key)
-            text = BAR_NAMES[key] + ("" if v is None else f" {v:.0f}%")
+            r = app.vision.get(key)
+            if r is None:
+                text = BAR_NAMES[key]
+            elif r["status"] == "ok":
+                text = f"{BAR_NAMES[key]} {r['value']:.0f}%"
+            elif r["status"] == "unsure":
+                text = f"{BAR_NAMES[key]} ? ({r['agree']:.0f}%)"
+            else:
+                text = f"{BAR_NAMES[key]}: нет"
             c.create_text(x2 + 10, y, text=text, anchor="w", fill=color, font=("Consolas", 9, "bold"))
 
     def _refresh(self):
