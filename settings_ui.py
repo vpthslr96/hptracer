@@ -324,6 +324,8 @@ class SettingsWindow:
         self.root = root
         self.app = app
         self.cfg = copy.deepcopy(app.cfg)
+        # список показываем в порядке реального приоритета (выше — важнее), порядок сохраняем при равенстве
+        self.cfg["scenarios"] = sorted(self.cfg.get("scenarios", []), key=lambda s: s.get("priority", 100))
         self.saved_snapshot = self._snapshot()
         self.sel = None          # индекс выбранного сценария
         self._loading = False    # не писать в модель, пока заполняем поля
