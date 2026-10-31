@@ -97,7 +97,6 @@
   "dead_confirm": 3,
   "event_ttl": 3.0,
   "key_hold": 0.05,
-  "sound": true,
   "overlay": true,
   "overlay_frames": true,
   "status_window_pos": [

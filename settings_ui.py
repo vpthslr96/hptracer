@@ -1530,7 +1530,6 @@ class SettingsWindow:
         f.pack(fill="x")
         check(f, ["dry_run"], "Тестовый режим — ничего не нажимать, только писать в лог")
         check(f, ["only_when_window_active"], "Нажимать, только когда окно игры активно")
-        check(f, ["sound"], "Звуковые сигналы")
         check(f, ["overlay_frames"], "Рамки вокруг полосок на экране (после перезапуска)")
         number(f, ["check_interval"], "Проверять экран каждые", 0.03, 1, 0.01, "сек")
         number(f, ["dead_confirm"], "Цель мертва после N проверок подряд", 1, 20, 1, "", int)

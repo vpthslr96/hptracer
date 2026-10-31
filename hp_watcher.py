@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HP Watcher v2.11 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
+HP Watcher v2.12 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
 нажатий клавиш по условиям. Все настройки — в config.json рядом со скриптом.
 Инструкция — в README.md.
 """
@@ -21,12 +21,11 @@ from logging.handlers import RotatingFileHandler
 
 import numpy as np
 
-VERSION = "2.11"
+VERSION = "2.12"
 IS_WIN = sys.platform == "win32"
 
 if IS_WIN:
     import ctypes.wintypes as wt
-    import winsound
 
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
@@ -86,19 +85,6 @@ KEY_ALIASES = {"escape": "esc", "return": "enter", "spacebar": "space",
                "page up": "pageup", "page down": "pagedown", "caps lock": "capslock",
                "num lock": "numlock", "scroll lock": "scrolllock",
                "print screen": "printscreen", "delete": "del"}
-BEEPS = {
-    "start": [(660, 70), (880, 90)],
-    "pause": [(440, 160)],
-    "resume": [(660, 70), (880, 90)],
-    "action": [(1200, 50)],
-    "calib": [(1400, 60)],
-    "error": [(300, 280)],
-    "rec_on": [(1000, 70), (1500, 90)],
-    "rec_off": [(1500, 70), (1000, 90)],
-    "test_on": [(900, 60), (900, 60), (900, 60)],
-    "test_off": [(900, 120)],
-    "alarm": [(1800, 180), (900, 180)],
-}
 
 DEFAULT_CONFIG = {
     "_пояснения": {
@@ -203,7 +189,6 @@ DEFAULT_CONFIG = {
     "dead_confirm": 3,
     "event_ttl": 3.0,
     "key_hold": 0.05,
-    "sound": True,
     "overlay": True,
     "overlay_frames": True,
     "status_window_pos": [20, 200],
@@ -1416,7 +1401,6 @@ class App:
             log.error("Не удалось прочитать config.json: %s", e)
             if first:
                 log.error("Работаю с настройками по умолчанию, файл не перезаписываю.")
-            self.beep("error")
             return False
         with self.lock:
             self.cfg = deep_merge(DEFAULT_CONFIG, user)
@@ -1573,7 +1557,6 @@ class App:
                 fn()
             except Exception:
                 log.exception("Ошибка в %s", fn.__name__)
-                self.beep("error")
         return lambda: threading.Thread(target=run, daemon=True).start()
 
     def print_help(self):
@@ -1618,12 +1601,10 @@ class App:
         hwnd = user32.GetForegroundWindow()
         if not hwnd or window_pid(hwnd) == os.getpid():
             log.warning("Переключитесь в окно игры и нажмите сочетание там.")
-            self.beep("error")
             return
         title = window_title(hwnd).strip()
         if not title:
             log.warning("У активного окна нет заголовка — привязать не получится.")
-            self.beep("error")
             return
         with self.lock:
             self.cfg["window_title"] = title
@@ -1631,7 +1612,6 @@ class App:
             self.save_config()
         log.info("Привязано к окну «%s». Если в заголовке меняется ник персонажа — "
                  "оставьте в config.json только постоянную часть.", title)
-        self.beep("calib")
 
     # ---------- калибровка ----------
 
@@ -1641,7 +1621,6 @@ class App:
             log.warning("Окно игры не найдено (window_title = «%s»). "
                         "Нажмите %s в окне игры, чтобы привязаться.",
                         self.cfg.get("window_title"), self.cfg["hotkeys"].get("bind_window"))
-            self.beep("error")
             return None, None
         x, y = cursor_pos()
         return origin, (x - origin[0], y - origin[1])
@@ -1649,7 +1628,6 @@ class App:
     def calib_next_bar(self):
         self.calib_index = (self.calib_index + 1) % len(BAR_KEYS)
         log.info("Калибруем: %s", BAR_NAMES[BAR_KEYS[self.calib_index]])
-        self.beep("calib")
 
     def calib_left(self):
         key = BAR_KEYS[self.calib_index]
@@ -1663,7 +1641,6 @@ class App:
                 bar["x2"] = 0
             self.save_config()
         log.info("[%s] левый край: x=%d y=%d. Теперь правый край.", BAR_NAMES[key], *rel)
-        self.beep("calib")
 
     def calib_right(self):
         import mss
@@ -1676,7 +1653,6 @@ class App:
             if rel[0] <= bar.get("x1", 0) or (bar.get("x1", 0) == 0 and bar.get("y", 0) == 0):
                 log.warning("[%s] сначала отметьте левый край, правый должен быть правее него.",
                             BAR_NAMES[key])
-                self.beep("error")
                 return
             if abs(rel[1] - bar["y"]) > 3:
                 log.warning("[%s] правый край на %d px выше/ниже левого — беру высоту левого.",
@@ -1690,7 +1666,6 @@ class App:
         log.info("[%s] правый край: x=%d, ширина %d px, цвет полоски %s. "
                  "Полоска при калибровке должна быть заполнена хотя бы на треть.",
                  BAR_NAMES[key], rel[0], bar["x2"] - bar["x1"] + 1, tuple(bar["color"]))
-        self.beep("calib")
 
     def auto_find(self):
         import mss
@@ -1698,7 +1673,6 @@ class App:
         if origin is None:
             log.warning("Окно игры не найдено — сначала привяжитесь (%s).",
                         self.cfg["hotkeys"].get("bind_window"))
-            self.beep("error")
             return
         ox, oy, w, h = origin
         with mss.mss() as sct:
@@ -1722,7 +1696,6 @@ class App:
         if ok:
             log.info("Проверьте рамки на оверлее. Если правый край короче полоски — "
                      "значит она была неполной; откалибруйте её вручную.")
-        self.beep("calib" if ok else "error")
 
     # ---------- пауза / выход / перечитать ----------
 
@@ -1733,18 +1706,15 @@ class App:
             self.pause_reason = None
             self.paused = False
             log.info("Продолжаю")
-            self.beep("resume")
         else:
             self.paused = True
             log.info("ПАУЗА")
-            self.beep("pause")
 
     def emergency_stop(self, reason):
         self.paused = True
         self.pause_reason = reason
         self.stats.emergencies += 1
         log.warning("!!! АВАРИЙНАЯ ПАУЗА: %s. Продолжить — %s", reason, self.cfg["hotkeys"].get("pause"))
-        self.beep("alarm", repeats=int(self.cfg["emergency"].get("alarm_repeats", 3)))
         if self.cfg["screenshots"].get("on_emergency", True):
             self.screenshot("АВАРИЯ " + reason)
 
@@ -1753,7 +1723,6 @@ class App:
         sc = next((s for s in self.cfg.get("scenarios", []) if s.get("name") == name), None)
         if sc is None or not sc.get("actions"):
             log.warning("Сценарий «%s» не найден или пуст", name)
-            self.beep("error")
             return
         self.request_run(name)
 
@@ -1778,7 +1747,6 @@ class App:
         self.input_error = err
         if err:
             log.warning(err)
-            self.beep("error")
         else:
             log.info("Способ ввода: %s", self.input_status)
         self._input_cfg = copy.deepcopy(self.cfg.get("input"))
@@ -1789,14 +1757,12 @@ class App:
         ck = self.cfg.get("clicker", {})
         if not ck.get("enabled"):
             log.info("Автокликер выключен в настройках (вкладка «Кликер и ввод»)")
-            self.beep("error")
             return
         if ck.get("mode") == "hold":
             log.info("Автокликер в режиме «пока зажата %s» — горячая клавиша не нужна", ck.get("hold_key"))
             return
         self.clicker_on = not self.clicker_on
         log.info("Автокликер: %s", "ВКЛ" if self.clicker_on else "выкл")
-        self.beep("resume" if self.clicker_on else "pause")
 
     def clicker_should_click(self):
         """Причина, почему сейчас не кликаем, или None — можно кликать."""
@@ -1881,7 +1847,6 @@ class App:
             self.register_hotkeys()
         if self.cfg.get("input") != getattr(self, "_input_cfg", None):
             self.setup_input()
-        self.beep("calib")
 
     def wait_modifiers_released(self, timeout=2.0):
         """Если пользователь держит Ctrl/Alt/Shift, игра получит Ctrl+F1 вместо F1.
@@ -1900,13 +1865,11 @@ class App:
             self.save_config()
         on = self.cfg["dry_run"]
         log.info("ТЕСТОВЫЙ РЕЖИМ: клавиши не нажимаются, только лог" if on else "Тестовый режим выключен")
-        self.beep("test_on" if on else "test_off")
 
     def stats_reset(self):
         self.log_stats()
         self.stats.reset()
         log.info("Статистика обнулена")
-        self.beep("calib")
 
     def log_stats(self):
         for line in self.stats.summary():
@@ -1950,7 +1913,6 @@ class App:
         if self.load_config():
             self.register_hotkeys()
             log.info("config.json перечитан")
-            self.beep("calib")
 
     def stop(self):
         log.info("Выход по горячей клавише")
@@ -1967,7 +1929,6 @@ class App:
             self._rec_hook = keyboard.hook(self._on_rec_event)
             log.info("ЗАПИСЬ: нажимайте клавиши в нужном темпе. Остановить — %s.",
                      self.cfg["hotkeys"].get("record"))
-            self.beep("rec_on")
             return
 
         self.recording = False
@@ -1977,7 +1938,6 @@ class App:
         ev = list(self._rec_events)
         if not ev:
             log.info("Запись остановлена — ничего не нажато.")
-            self.beep("rec_off")
             return
         actions = []
         for i, (key, t) in enumerate(ev):
@@ -1995,7 +1955,6 @@ class App:
             self.save_config()
         log.info("Записано %d нажатий в «%s»: %s", len(actions), target,
                  ", ".join(f"{k} ({d} c)" for k, d in actions))
-        self.beep("rec_off")
 
     def _on_rec_event(self, e):
         import keyboard
@@ -2018,16 +1977,6 @@ class App:
         log.info("  запись: %s", name)
 
     # ---------- основной цикл ----------
-
-    def beep(self, kind, repeats=1):
-        if not IS_WIN or not self.cfg.get("sound", True):
-            return
-        seq = BEEPS.get(kind, []) * max(1, repeats)
-
-        def play():
-            for f, d in seq:
-                winsound.Beep(f, d)
-        threading.Thread(target=play, daemon=True).start()
 
     def can_continue(self):
         if not self.running or self.paused or self.recording:
@@ -2074,7 +2023,6 @@ class App:
         self.stats.scenarios[name] = self.stats.scenarios.get(name, 0) + 1
         self.executing = name
         log.info("▶ %s%s", name, "  [ТЕСТ — без нажатий]" if dry else "")
-        self.beep("action")
         if self.cfg["screenshots"].get("on_scenario", True):
             self.screenshot(name)
         ok = True
@@ -2545,7 +2493,6 @@ class App:
                 self.save_config()
             tr.update(cand=None, hits=0)
             log.info("Окно цели сдвинуто на (%+d, %+d) — полоска найдена на новом месте", dx, dy)
-            self.beep("calib")
 
     def tick(self):
         self.poll(force=True)
@@ -2851,7 +2798,6 @@ def main():
 
     threading.Thread(target=app.worker, daemon=True).start()
     threading.Thread(target=app.clicker_worker, daemon=True).start()
-    app.beep("start")
 
     try:
         Overlay(app).run()
