@@ -178,7 +178,8 @@
     "search_after": 1.0,
     "attack_repeat": 2.0,
     "pause_on_hp_drop": false,
-    "target_mode": "vision"
+    "target_mode": "nexttarget",
+    "stuck_after": 8.0
   },
   "record_into": "После убийства моба",
   "record_last_delay": 0.5,

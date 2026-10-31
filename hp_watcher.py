@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HP Watcher v2.10 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
+HP Watcher v2.11 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
 нажатий клавиш по условиям. Все настройки — в config.json рядом со скриптом.
 Инструкция — в README.md.
 """
@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler
 
 import numpy as np
 
-VERSION = "2.10"
+VERSION = "2.11"
 IS_WIN = sys.platform == "win32"
 
 if IS_WIN:
@@ -69,10 +69,10 @@ HUNT_DEFAULTS = {
     "attack": "f1", "next_target": "f2", "pickup": "f4", "potion": "f9",
     "potion_hp": 50, "potion_cooldown": 10, "pickup_times": 3, "pickup_delay": 0.5,
     "search_after": 1.0, "attack_repeat": 2.0, "pause_on_hp_drop": False,
-    "target_mode": "vision",
+    "target_mode": "nexttarget", "stuck_after": 8.0,
 }
 BAR_NAMES = {"target_hp": "HP цели", "my_hp": "моё HP", "my_mp": "моё MP"}
-VALUE_KEYS = BAR_KEYS + ["no_target_sec"]
+VALUE_KEYS = BAR_KEYS + ["no_target_sec", "target_stuck_sec"]
 MIN_REPEAT = 0.3  # сценарий без события не повторяется чаще, чем раз в столько секунд
 OVERLAY_COLORS = {"target_hp": "#ffd400", "my_hp": "#3cff6a", "my_mp": "#38d6ff"}
 EVENTS = {"target_died", "target_lost"}
@@ -907,7 +907,7 @@ def scan_code(name):
 
 # ---------- Быстрая настройка охоты ----------
 
-HUNT_NAMES = ["Банка HP", "После убийства моба", "После потери цели", "Атака в бою", "Взять цель"]
+HUNT_NAMES = ["Банка HP", "После убийства моба", "После потери цели", "Застрял на мобе", "Атака в бою", "Взять цель"]
 
 
 def hunt_scenarios(p):
@@ -922,6 +922,10 @@ def hunt_scenarios(p):
          "conditions": [{"event": "target_died"}], "actions": pick + copy.deepcopy(take)},
         {"name": "После потери цели", "enabled": True, "cooldown": 0,
          "conditions": [{"event": "target_lost"}], "actions": copy.deepcopy(take)},
+        {"name": "Застрял на мобе", "enabled": float(p.get("stuck_after") or 0) > 0,
+         "cooldown": max(2.0, float(p.get("stuck_after") or 8)),
+         "conditions": [{"value": "target_stuck_sec", "op": ">=", "than": max(2.0, float(p.get("stuck_after") or 8))}],
+         "actions": [["@next_target", 0.5], ["@attack", 0.3]]},
         {"name": "Атака в бою", "enabled": True, "cooldown": float(p["attack_repeat"]),
          "conditions": [{"value": "target_hp", "op": ">", "than": 0}], "actions": [["@attack", 0.1]]},
         {"name": "Взять цель", "enabled": True, "cooldown": 2,
@@ -1521,7 +1525,7 @@ class App:
                         log.warning("Сценарий «%s»: неизвестное событие %r", name, c["event"])
                 elif c.get("value") not in VALUE_KEYS or c.get("op", "<") not in OPS:
                     log.warning("Сценарий «%s»: непонятное условие %r", name, c)
-                elif c["value"] == "no_target_sec":
+                elif c["value"] in ("no_target_sec", "target_stuck_sec"):
                     if not bar_ready(self.cfg["bars"].get("target_hp")):
                         log.warning("Сценарий «%s»: полоска HP цели ещё не откалибрована", name)
                 elif not bar_ready(self.cfg["bars"].get(c["value"])):
@@ -2404,6 +2408,15 @@ class App:
                 vals["no_target_sec"] = now - self.no_target_since
             elif self.no_target_since is not None:  # unsure — не знаем, продолжаем отсчёт
                 vals["no_target_sec"] = now - self.no_target_since
+        # Сколько секунд у живой цели не убывает HP (моб недоступен, за текстурой, персонаж застрял)
+        if tstat == "ok" and t > 0:
+            st = getattr(self, "_stuck", None)
+            if st is None or t < st[0] - 0.9 or t > st[0] + 5:
+                self._stuck = st = (t, now)   # урон прошёл или это новая цель
+            vals["target_stuck_sec"] = now - st[1]
+        elif tstat in ("ok", "absent"):
+            self._stuck = None
+            vals["target_stuck_sec"] = 0.0
         self.values = vals
         if tstat == "absent" and vis.get("track_moved", True):
             self.track_target_bar(ox, oy, origin, now)
@@ -2460,6 +2473,7 @@ class App:
             self._vision_target_point = None
 
     def on_target_killed(self, how):
+        self._stuck = None
         self.forget_vision_target()
         self.target_alive = False
         self.target_last_hp = None

@@ -53,11 +53,13 @@ VALUE_LABELS = [
     ("my_hp", "Моё HP, %"),
     ("my_mp", "Моё MP, %"),
     ("no_target_sec", "Цели нет, сек"),
+    ("target_stuck_sec", "Моб без урона, сек"),
 ]
 VALUE_LABEL = dict(VALUE_LABELS)
 VALUE_BY_LABEL = {v: k for k, v in VALUE_LABELS}
 OPS = ["<", "<=", ">", ">=", "==", "!="]
-VALUE_SHORT = {"target_hp": "HP цели", "my_hp": "моё HP", "my_mp": "моё MP", "no_target_sec": "нет цели, с"}
+VALUE_SHORT = {"target_hp": "HP цели", "my_hp": "моё HP", "my_mp": "моё MP", "no_target_sec": "нет цели, с",
+               "target_stuck_sec": "моб без урона, с"}
 
 
 def describe_conds(conds):
@@ -620,45 +622,46 @@ class SettingsWindow:
             ttk.Label(row, text=unit).pack(side="left")
 
         key_row(1, "attack", "Атака", "«Атака» из окна действий (Alt+C)")
-        key_row(2, "next_target", "Следующая цель", "/nexttarget (и запасной вариант для зрения)")
+        key_row(2, "next_target", "Взять цель", "/nexttarget или макрос с /target Имя моба")
         tm = ttk.Frame(f)
-        tm.grid(row=16, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        tm.grid(row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
         ttk.Label(tm, text="Как брать цель:").pack(side="left")
-        v["target_mode"] = tk.StringVar(value=p.get("target_mode", "vision"))
-        ttk.Radiobutton(tm, text="зрением — клик под ником ближайшего моба", value="vision",
+        v["target_mode"] = tk.StringVar(value=p.get("target_mode", "nexttarget"))
+        ttk.Radiobutton(tm, text="клавишей, без мыши (рекомендуется)", value="nexttarget",
                         variable=v["target_mode"]).pack(side="left", padx=(8, 0))
-        ttk.Radiobutton(tm, text="/nexttarget", value="nexttarget",
+        ttk.Radiobutton(tm, text="зрением (клик мышью)", value="vision",
                         variable=v["target_mode"]).pack(side="left", padx=(8, 0))
         tt = ttk.Frame(f)
-        tt.grid(row=17, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        tt.grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
         ttk.Button(tt, text="Проверить поиск мобов (через 3 с)",
                    command=lambda: self.countdown(scan_label, "Переключитесь в игру", lambda: self.test_scan(scan_label))
                    ).pack(side="left")
         scan_label = ttk.Label(tt, text="", foreground="#286b2e", wraplength=360, justify="left")
         scan_label.pack(side="left", padx=8)
-        num_row(3, "search_after", "Брать цель, если её нет", 0.5, 30, 0.5, "сек (и сразу после запуска)")
-        num_row(4, "attack_repeat", "Повторять атаку в бою раз в", 0.5, 30, 0.5, "сек")
-        key_row(5, "pickup", "Подбор дропа", "«Поднять»; пусто — не подбирать")
-        num_row(6, "pickup_times", "После убийства нажать", 0, 20, 1, "раз")
-        num_row(7, "pickup_delay", "с паузой", 0.1, 5, 0.1, "сек (персонаж подбегает к дропу)")
-        key_row(8, "potion", "Банка HP", "пусто — не пить")
-        num_row(9, "potion_hp", "Пить, если моё HP ниже", 1, 99, 5, "%")
-        num_row(10, "potion_cooldown", "Не чаще, чем раз в", 1, 600, 1, "сек (откат банки)")
+        num_row(5, "search_after", "Брать цель, если её нет", 0.5, 30, 0.5, "сек (и сразу после запуска)")
+        num_row(6, "attack_repeat", "Повторять атаку в бою раз в", 0.5, 30, 0.5, "сек")
+        num_row(7, "stuck_after", "Моб не получает урон — сменить цель через", 0, 60, 1, "сек (0 — не менять)")
+        key_row(8, "pickup", "Подбор дропа", "«Поднять»; пусто — не подбирать")
+        num_row(9, "pickup_times", "После убийства нажать", 0, 20, 1, "раз")
+        num_row(10, "pickup_delay", "с паузой", 0.1, 5, 0.1, "сек (персонаж подбегает к дропу)")
+        key_row(11, "potion", "Банка HP", "пусто — не пить")
+        num_row(12, "potion_hp", "Пить, если моё HP ниже", 1, 99, 5, "%")
+        num_row(13, "potion_cooldown", "Не чаще, чем раз в", 1, 600, 1, "сек (откат банки)")
         v["pause_on_hp_drop"] = tk.BooleanVar(value=bool(p.get("pause_on_hp_drop")))
         ttk.Checkbutton(f, variable=v["pause_on_hp_drop"], text="Пауза при резком падении HP"
-                        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(6, 0))
+                        ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(f, text="выкл. — пьём банку; пауза на смерть остаётся", foreground="#555"
-                  ).grid(row=11, column=3, sticky="w", pady=(6, 0))
+                  ).grid(row=14, column=3, sticky="w", pady=(6, 0))
         warn = ttk.Label(f, text="", foreground="#a33", wraplength=520, justify="left")
-        warn.grid(row=14, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        warn.grid(row=16, column=0, columnspan=4, sticky="w", pady=(8, 0))
         if not hw.bar_ready(self.app.cfg["bars"].get("my_hp")):
             warn.config(text="Полоска «моё HP» не настроена — банка не сработает. Настройте её на вкладке «Полоски».")
         ttk.Label(f, foreground="#555", wraplength=520, justify="left", text=(
-            "Сценарии «Банка HP», «После убийства моба», «После потери цели», «Атака в бою» и «Взять цель» "
-            "будут заменены и встанут наверх списка. Остальные ваши сценарии останутся ниже."
-        )).grid(row=12, column=0, columnspan=4, sticky="w", pady=(8, 0))
+            "Сценарии охоты («Банка HP», «После убийства моба», «После потери цели», «Застрял на мобе», "
+            "«Атака в бою», «Взять цель») будут заменены и встанут наверх списка. Остальные ваши сценарии останутся ниже."
+        )).grid(row=15, column=0, columnspan=4, sticky="w", pady=(8, 0))
         btns = ttk.Frame(f)
-        btns.grid(row=18, column=0, columnspan=4, sticky="e", pady=(12, 0))
+        btns.grid(row=17, column=0, columnspan=4, sticky="e", pady=(12, 0))
 
         def apply():
             q = {}
@@ -672,7 +675,8 @@ class SettingsWindow:
                     warn.config(text=f"{k}: {check_key(k, {}, mapping)}")
                     return
                 q[name] = k
-            for name, lo, hi in (("search_after", 0.5, 30), ("attack_repeat", 0.5, 30), ("pickup_times", 0, 20),
+            for name, lo, hi in (("search_after", 0.5, 30), ("attack_repeat", 0.5, 30), ("stuck_after", 0, 60),
+                                 ("pickup_times", 0, 20),
                                  ("pickup_delay", 0.1, 5), ("potion_hp", 1, 99), ("potion_cooldown", 1, 600)):
                 q[name] = min(hi, max(lo, fnum(v[name].get(), hw.HUNT_DEFAULTS[name])))
             q["pickup_times"] = int(q["pickup_times"])
