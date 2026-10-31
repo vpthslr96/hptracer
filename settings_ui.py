@@ -587,11 +587,7 @@ class SettingsWindow:
     # ---------- быстрая настройка охоты ----------
 
     def open_hunt_wizard(self):
-        p = {**hw.HUNT_DEFAULTS, **(self.cfg.get("hunt") or {})}
-        sk = self.skill_keys()
-        for k in ("attack", "next_target", "pickup", "potion"):
-            if sk.get(k):
-                p[k] = sk[k]
+        p = hw.hunt_params(self.cfg)
         win = tk.Toplevel(self.win)
         win.title("Быстрая настройка охоты")
         win.transient(self.win)
@@ -654,7 +650,11 @@ class SettingsWindow:
                   ).grid(row=14, column=3, sticky="w", pady=(6, 0))
         warn = ttk.Label(f, text="", foreground="#a33", wraplength=520, justify="left")
         warn.grid(row=16, column=0, columnspan=4, sticky="w", pady=(8, 0))
-        if not hw.bar_ready(self.app.cfg["bars"].get("my_hp")):
+        probs = hw.hunt_problems(self.cfg)
+        if probs:
+            warn.config(text="Сейчас эти настройки НЕ действуют: " + "; ".join(probs)
+                        + ". Нажмите «Применить и сохранить».")
+        elif not hw.bar_ready(self.app.cfg["bars"].get("my_hp")):
             warn.config(text="Полоска «моё HP» не настроена — банка не сработает. Настройте её на вкладке «Полоски».")
         ttk.Label(f, foreground="#555", wraplength=520, justify="left", text=(
             "Сценарии охоты («Банка HP», «После убийства моба», «После потери цели», «Застрял на мобе», "

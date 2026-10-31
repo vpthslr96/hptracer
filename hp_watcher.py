@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HP Watcher v2.12 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
+HP Watcher v2.13 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
 нажатий клавиш по условиям. Все настройки — в config.json рядом со скриптом.
 Инструкция — в README.md.
 """
@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler
 
 import numpy as np
 
-VERSION = "2.12"
+VERSION = "2.13"
 IS_WIN = sys.platform == "win32"
 
 if IS_WIN:
@@ -919,6 +919,38 @@ def hunt_scenarios(p):
     ]
 
 
+def hunt_params(cfg):
+    """Настройки охоты так, как их показывает окно быстрой настройки: блок hunt + кнопки панели."""
+    p = {**HUNT_DEFAULTS, **(cfg.get("hunt") or {})}
+    sk = cfg.get("skill_keys") or {}
+    for k in ("attack", "next_target", "pickup", "potion"):
+        if sk.get(k):
+            p[k] = sk[k]
+    return p
+
+
+def hunt_problems(cfg):
+    """Чем сценарии в конфиге расходятся с настройками охоты. Пусто — охота применена как надо."""
+    p = hunt_params(cfg)
+    have = {s.get("name"): s for s in cfg.get("scenarios", [])}
+    out = []
+    for want in hunt_scenarios(p):
+        cur = have.get(want["name"])
+        if cur is None:
+            out.append(f"нет сценария «{want['name']}»")
+        elif want["enabled"] and not cur.get("enabled", True):
+            out.append(f"сценарий «{want['name']}» выключен")
+    return out
+
+
+def hunt_never_applied(cfg):
+    """Быструю настройку охоты к этому конфигу ни разу не применяли (так выглядит config.json
+    из архива релиза: блок hunt есть, а сценарии старые — без «Взять цель» и с выключенной банкой)."""
+    offered = cfg.get("offered_defaults") or []
+    names = {s.get("name") for s in cfg.get("scenarios", [])}
+    return "Взять цель" not in offered and "Взять цель" not in names
+
+
 def apply_hunt_preset(cfg, p):
     """Вписывает цикл охоты в конфиг: кнопки панели и 5 сценариев наверху списка.
     Остальные сценарии пользователя остаются ниже, как были."""
@@ -1454,6 +1486,15 @@ class App:
                 log.info("Сценарий «%s»: атака теперь жмётся после того, как появилась новая цель", sc["name"])
                 changed = True
         self.cfg["offered_defaults"] = offered
+        if hunt_never_applied(self.cfg):
+            # Окно быстрой настройки показывает блок hunt (F9, 50%, 8 с…), значит и работать
+            # должно ровно это. Раньше config.json из релиза затирал применённую охоту.
+            apply_hunt_preset(self.cfg, hunt_params(self.cfg))
+            log.warning("Сценарии охоты не были применены (старый config.json из архива?) — "
+                        "применяю быструю настройку охоты: %s",
+                        ", ".join(s["name"] + ("" if s.get("enabled", True) else " (выкл)")
+                                  for s in self.cfg["scenarios"] if s["name"] in HUNT_NAMES))
+            changed = True
         return changed
 
     def save_config(self):
@@ -1515,6 +1556,11 @@ class App:
                 elif not bar_ready(self.cfg["bars"].get(c["value"])):
                     log.warning("Сценарий «%s»: полоска %s ещё не откалибрована",
                                 name, BAR_NAMES[c["value"]])
+        probs = hunt_problems(self.cfg)
+        if probs:
+            log.warning("Охота работает не так, как в быстрой настройке: %s. "
+                        "Откройте «Быструю настройку охоты» и нажмите «Применить и сохранить».",
+                        "; ".join(probs))
 
     # ---------- горячие клавиши ----------
 

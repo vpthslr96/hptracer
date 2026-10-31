@@ -19,12 +19,14 @@
   "window_title": "Lineage",
   "skill_keys": {
     "attack": "f1",
-    "next_target": "f2"
+    "next_target": "f2",
+    "pickup": "f4",
+    "potion": "f9"
   },
   "dry_run": false,
   "emergency": {
     "on_death": true,
-    "hp_drop_percent": 40,
+    "hp_drop_percent": 0,
     "hp_drop_seconds": 3.0,
     "alarm_repeats": 3
   },
@@ -163,7 +165,9 @@
     "Скилл в бою",
     "Бафф",
     "Банка HP",
-    "Банка MP"
+    "Банка MP",
+    "Застрял на мобе",
+    "Взять цель"
   ],
   "hunt": {
     "attack": "f1",
@@ -184,9 +188,27 @@
   "record_last_delay": 0.5,
   "scenarios": [
     {
+      "name": "Банка HP",
+      "enabled": true,
+      "cooldown": 10.0,
+      "conditions": [
+        {
+          "value": "my_hp",
+          "op": "<",
+          "than": 50.0
+        }
+      ],
+      "actions": [
+        [
+          "@potion",
+          0.2
+        ]
+      ],
+      "priority": 10
+    },
+    {
       "name": "После убийства моба",
       "enabled": true,
-      "priority": 10,
       "cooldown": 0,
       "conditions": [
         {
@@ -195,23 +217,31 @@
       ],
       "actions": [
         [
-          "@next_target",
-          0.2
+          "@pickup",
+          0.5
         ],
         [
-          "wait_target",
+          "@pickup",
+          0.5
+        ],
+        [
+          "@pickup",
+          0.5
+        ],
+        [
+          "find_target",
           2.0
         ],
         [
           "@attack",
           0.3
         ]
-      ]
+      ],
+      "priority": 20
     },
     {
       "name": "После потери цели",
       "enabled": true,
-      "priority": 15,
       "cooldown": 0,
       "conditions": [
         {
@@ -220,24 +250,43 @@
       ],
       "actions": [
         [
-          "@next_target",
-          0.2
-        ],
-        [
-          "wait_target",
+          "find_target",
           2.0
         ],
         [
           "@attack",
           0.3
         ]
-      ]
+      ],
+      "priority": 30
+    },
+    {
+      "name": "Застрял на мобе",
+      "enabled": true,
+      "cooldown": 8.0,
+      "conditions": [
+        {
+          "value": "target_stuck_sec",
+          "op": ">=",
+          "than": 8.0
+        }
+      ],
+      "actions": [
+        [
+          "@next_target",
+          0.5
+        ],
+        [
+          "@attack",
+          0.3
+        ]
+      ],
+      "priority": 40
     },
     {
       "name": "Атака в бою",
       "enabled": true,
-      "priority": 18,
-      "cooldown": 2,
+      "cooldown": 2.0,
       "conditions": [
         {
           "value": "target_hp",
@@ -250,31 +299,47 @@
           "@attack",
           0.1
         ]
-      ]
+      ],
+      "priority": 50
     },
     {
-      "name": "Поиск цели",
-      "enabled": false,
-      "priority": 20,
-      "cooldown": 3,
+      "name": "Взять цель",
+      "enabled": true,
+      "cooldown": 2,
       "conditions": [
         {
           "value": "no_target_sec",
           "op": ">=",
-          "than": 4
+          "than": 1.0
         }
       ],
       "actions": [
         [
-          "@next_target",
-          0.2
-        ],
-        [
-          "wait_target",
+          "find_target",
           2.0
         ],
         [
           "@attack",
+          0.3
+        ]
+      ],
+      "priority": 60
+    },
+    {
+      "name": "Банка MP",
+      "enabled": false,
+      "priority": 70,
+      "cooldown": 15,
+      "conditions": [
+        {
+          "value": "my_mp",
+          "op": "<",
+          "than": 20
+        }
+      ],
+      "actions": [
+        [
+          "f10",
           0.3
         ]
       ]
@@ -282,7 +347,7 @@
     {
       "name": "Скилл в бою",
       "enabled": false,
-      "priority": 30,
+      "priority": 80,
       "cooldown": 5,
       "conditions": [
         {
@@ -301,7 +366,7 @@
     {
       "name": "Бафф",
       "enabled": false,
-      "priority": 40,
+      "priority": 90,
       "cooldown": 1200,
       "conditions": [
         {
@@ -314,44 +379,6 @@
         [
           "f5",
           2.0
-        ]
-      ]
-    },
-    {
-      "name": "Банка HP",
-      "enabled": false,
-      "priority": 1,
-      "cooldown": 15,
-      "conditions": [
-        {
-          "value": "my_hp",
-          "op": "<",
-          "than": 40
-        }
-      ],
-      "actions": [
-        [
-          "f9",
-          0.3
-        ]
-      ]
-    },
-    {
-      "name": "Банка MP",
-      "enabled": false,
-      "priority": 2,
-      "cooldown": 15,
-      "conditions": [
-        {
-          "value": "my_mp",
-          "op": "<",
-          "than": 20
-        }
-      ],
-      "actions": [
-        [
-          "f10",
-          0.3
         ]
       ]
     }
