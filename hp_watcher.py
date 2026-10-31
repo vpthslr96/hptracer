@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HP Watcher v2.6 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
+HP Watcher v2.7 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
 нажатий клавиш по условиям. Все настройки — в config.json рядом со скриптом.
 Инструкция — в README.md.
 """
@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler
 
 import numpy as np
 
-VERSION = "2.6"
+VERSION = "2.7"
 IS_WIN = sys.platform == "win32"
 
 if IS_WIN:
@@ -64,6 +64,12 @@ CONFIG_PATH = os.path.join(app_dir(), "config.json")
 LOG_PATH = os.path.join(app_dir(), "hp_watcher.log")
 
 BAR_KEYS = ["target_hp", "my_hp", "my_mp"]
+# Быстрая настройка охоты: значения по умолчанию
+HUNT_DEFAULTS = {
+    "attack": "f1", "next_target": "f2", "pickup": "f4", "potion": "f9",
+    "potion_hp": 50, "potion_cooldown": 10, "pickup_times": 3, "pickup_delay": 0.5,
+    "search_after": 1.0, "attack_repeat": 2.0, "pause_on_hp_drop": False,
+}
 BAR_NAMES = {"target_hp": "HP цели", "my_hp": "моё HP", "my_mp": "моё MP"}
 VALUE_KEYS = BAR_KEYS + ["no_target_sec"]
 MIN_REPEAT = 0.3  # сценарий без события не повторяется чаще, чем раз в столько секунд
@@ -205,6 +211,7 @@ DEFAULT_CONFIG = {
         "exit": "ctrl+alt+end",
     },
     "offered_defaults": [],
+    "hunt": dict(HUNT_DEFAULTS),
     "record_into": "После убийства моба",
     "record_last_delay": 0.5,
     "scenarios": [
@@ -877,6 +884,66 @@ MOUSE_RE = re.compile(r"^(click|dblclick|move)(?::(left|right|middle))?(?:\*(\d{
 def scan_code(name):
     name = SCAN_ALIASES.get(name, name)
     return SCAN_CODES.get(name)
+
+
+# ---------- Быстрая настройка охоты ----------
+
+HUNT_NAMES = ["Банка HP", "После убийства моба", "После потери цели", "Атака в бою", "Взять цель"]
+
+
+def hunt_scenarios(p):
+    """Цикл охоты: взять цель → бить → убил → подобрать дроп → следующая цель… + банка по HP."""
+    take = [["@next_target", 0.2], ["wait_target", 2.0], ["@attack", 0.3]]
+    pick = [["@pickup", float(p["pickup_delay"])] for _ in range(int(p["pickup_times"]))] if p.get("pickup") else []
+    return [
+        {"name": "Банка HP", "enabled": bool(p.get("potion")), "cooldown": float(p["potion_cooldown"]),
+         "conditions": [{"value": "my_hp", "op": "<", "than": float(p["potion_hp"])}],
+         "actions": [["@potion", 0.2]]},
+        {"name": "После убийства моба", "enabled": True, "cooldown": 0,
+         "conditions": [{"event": "target_died"}], "actions": pick + copy.deepcopy(take)},
+        {"name": "После потери цели", "enabled": True, "cooldown": 0,
+         "conditions": [{"event": "target_lost"}], "actions": copy.deepcopy(take)},
+        {"name": "Атака в бою", "enabled": True, "cooldown": float(p["attack_repeat"]),
+         "conditions": [{"value": "target_hp", "op": ">", "than": 0}], "actions": [["@attack", 0.1]]},
+        {"name": "Взять цель", "enabled": True, "cooldown": 2,
+         "conditions": [{"value": "no_target_sec", "op": ">=", "than": float(p["search_after"])}],
+         "actions": copy.deepcopy(take)},
+    ]
+
+
+def apply_hunt_preset(cfg, p):
+    """Вписывает цикл охоты в конфиг: кнопки панели и 5 сценариев наверху списка.
+    Остальные сценарии пользователя остаются ниже, как были."""
+    p = {**HUNT_DEFAULTS, **(p or {})}
+    sk = cfg.setdefault("skill_keys", {})
+    for name in ("attack", "next_target", "pickup", "potion"):
+        if p.get(name):
+            sk[name] = str(p[name]).strip().lower()
+        else:
+            sk.pop(name, None)
+    old = cfg.get("scenarios", [])
+    # «Поиск цели» прошлых версий — это теперь «Взять цель»
+    old = [s for s in old if s.get("name") not in HUNT_NAMES + ["Поиск цели"]]
+    new = hunt_scenarios(p)
+    for i, sc in enumerate(new):
+        sc["priority"] = (i + 1) * 10
+    rest = sorted(old, key=lambda s: s.get("priority", 100))
+    for i, sc in enumerate(rest):
+        sc["priority"] = (len(new) + i + 1) * 10
+    cfg["scenarios"] = new + rest
+    cfg["hunt"] = {k: p[k] for k in HUNT_DEFAULTS}
+    # В охоте резкое падение HP лечится банкой, а не паузой (на паузе банка не нажмётся).
+    # Пауза на смерть остаётся.
+    em = cfg.setdefault("emergency", {})
+    if p.get("pause_on_hp_drop"):
+        em["hp_drop_percent"] = em.get("hp_drop_percent") or 40
+    else:
+        em["hp_drop_percent"] = 0
+    offered = cfg.setdefault("offered_defaults", [])
+    for n in HUNT_NAMES + ["Поиск цели"]:
+        if n not in offered:
+            offered.append(n)
+    return cfg
 
 
 def known_keys():

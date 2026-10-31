@@ -136,6 +136,19 @@
     "Банка HP",
     "Банка MP"
   ],
+  "hunt": {
+    "attack": "f1",
+    "next_target": "f2",
+    "pickup": "f4",
+    "potion": "f9",
+    "potion_hp": 50,
+    "potion_cooldown": 10,
+    "pickup_times": 3,
+    "pickup_delay": 0.5,
+    "search_after": 1.0,
+    "attack_repeat": 2.0,
+    "pause_on_hp_drop": false
+  },
   "record_into": "После убийства моба",
   "record_last_delay": 0.5,
   "scenarios": [

@@ -64,7 +64,8 @@ def describe_conds(conds):
     return ", ".join(f"{VALUE_SHORT.get(c.get('value'), c.get('value'))} {c.get('op')} {fnum(c.get('than')):g}"
                      for c in conds)
 
-SKILL_HINTS = {"attack": "Атака", "next_target": "Следующая цель (/nexttarget)"}
+SKILL_HINTS = {"attack": "Атака", "next_target": "Следующая цель (/nexttarget)",
+               "pickup": "Поднять (подбор дропа)", "potion": "Банка HP"}
 
 HOTKEY_LABELS = [
     ("settings", "Окно настроек"),
@@ -478,6 +479,7 @@ class SettingsWindow:
 
         left = ttk.Frame(t)
         left.grid(row=0, column=0, sticky="nsw", padx=(0, 10))
+        ttk.Button(left, text="⚡ Быстрая настройка охоты…", command=self.open_hunt_wizard).pack(fill="x", pady=(0, 6))
         ttk.Label(left, text="Сценарии (выше — важнее)").pack(anchor="w")
         cols = ("on", "name", "when", "every")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", height=16, selectmode="browse")
@@ -579,6 +581,107 @@ class SettingsWindow:
 
         for v in (self.v_name, self.v_enabled, self.v_trigger, self.v_param, self.v_repeat):
             v.trace_add("write", lambda *a: self.editor_changed())
+
+    # ---------- быстрая настройка охоты ----------
+
+    def open_hunt_wizard(self):
+        p = {**hw.HUNT_DEFAULTS, **(self.cfg.get("hunt") or {})}
+        sk = self.skill_keys()
+        for k in ("attack", "next_target", "pickup", "potion"):
+            if sk.get(k):
+                p[k] = sk[k]
+        win = tk.Toplevel(self.win)
+        win.title("Быстрая настройка охоты")
+        win.transient(self.win)
+        win.resizable(False, False)
+        f = ttk.Frame(win, padding=14)
+        f.pack(fill="both", expand=True)
+        f.columnconfigure(3, weight=1)  # лишняя ширина строк-«пролётов» уходит в колонку подсказок
+        ttk.Label(f, wraplength=520, justify="left", text=(
+            "Цикл: взять цель → бежать и бить → убил → подобрать дроп → следующая цель… "
+            "Плюс банка, когда HP ниже порога. Укажите клавиши, на которых это стоит у вас на панели."
+        )).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
+        v = {}
+
+        def key_row(r, name, text, hint=""):
+            ttk.Label(f, text=text).grid(row=r, column=0, sticky="w", pady=3)
+            v[name] = tk.StringVar(value=str(p.get(name) or ""))
+            ttk.Entry(f, textvariable=v[name], width=10).grid(row=r, column=1, sticky="w")
+            ttk.Button(f, text="⌨", width=3, command=lambda: key_capture(win, v[name].set)).grid(row=r, column=2, padx=4)
+            if hint:
+                ttk.Label(f, text=hint, foreground="#555").grid(row=r, column=3, sticky="w")
+
+        def num_row(r, name, text, lo, hi, step, unit):
+            row = ttk.Frame(f)
+            row.grid(row=r, column=0, columnspan=4, sticky="w", pady=2, padx=(20, 0))
+            ttk.Label(row, text=text).pack(side="left")
+            v[name] = tk.StringVar(value=f"{fnum(p.get(name)):g}")
+            ttk.Spinbox(row, textvariable=v[name], from_=lo, to=hi, increment=step, width=6).pack(side="left", padx=4)
+            ttk.Label(row, text=unit).pack(side="left")
+
+        key_row(1, "attack", "Атака", "«Атака» из окна действий (Alt+C)")
+        key_row(2, "next_target", "Следующая цель", "/nexttarget")
+        num_row(3, "search_after", "Брать цель, если её нет", 0.5, 30, 0.5, "сек (и сразу после запуска)")
+        num_row(4, "attack_repeat", "Повторять атаку в бою раз в", 0.5, 30, 0.5, "сек")
+        key_row(5, "pickup", "Подбор дропа", "«Поднять»; пусто — не подбирать")
+        num_row(6, "pickup_times", "После убийства нажать", 0, 20, 1, "раз")
+        num_row(7, "pickup_delay", "с паузой", 0.1, 5, 0.1, "сек (персонаж подбегает к дропу)")
+        key_row(8, "potion", "Банка HP", "пусто — не пить")
+        num_row(9, "potion_hp", "Пить, если моё HP ниже", 1, 99, 5, "%")
+        num_row(10, "potion_cooldown", "Не чаще, чем раз в", 1, 600, 1, "сек (откат банки)")
+        v["pause_on_hp_drop"] = tk.BooleanVar(value=bool(p.get("pause_on_hp_drop")))
+        ttk.Checkbutton(f, variable=v["pause_on_hp_drop"], text="Пауза при резком падении HP"
+                        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(f, text="выкл. — пьём банку; пауза на смерть остаётся", foreground="#555"
+                  ).grid(row=11, column=3, sticky="w", pady=(6, 0))
+        warn = ttk.Label(f, text="", foreground="#a33", wraplength=520, justify="left")
+        warn.grid(row=14, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        if not hw.bar_ready(self.app.cfg["bars"].get("my_hp")):
+            warn.config(text="Полоска «моё HP» не настроена — банка не сработает. Настройте её на вкладке «Полоски».")
+        ttk.Label(f, foreground="#555", wraplength=520, justify="left", text=(
+            "Сценарии «Банка HP», «После убийства моба», «После потери цели», «Атака в бою» и «Взять цель» "
+            "будут заменены и встанут наверх списка. Остальные ваши сценарии останутся ниже."
+        )).grid(row=12, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        btns = ttk.Frame(f)
+        btns.grid(row=15, column=0, columnspan=4, sticky="e", pady=(12, 0))
+
+        def apply():
+            q = {}
+            mapping = self.mapping()
+            for name in ("attack", "next_target", "pickup", "potion"):
+                k = key_token(v[name].get())
+                if not k and name in ("attack", "next_target"):
+                    warn.config(text="Укажите клавиши атаки и следующей цели.")
+                    return
+                if k and check_key(k, {}, mapping):
+                    warn.config(text=f"{k}: {check_key(k, {}, mapping)}")
+                    return
+                q[name] = k
+            for name, lo, hi in (("search_after", 0.5, 30), ("attack_repeat", 0.5, 30), ("pickup_times", 0, 20),
+                                 ("pickup_delay", 0.1, 5), ("potion_hp", 1, 99), ("potion_cooldown", 1, 600)):
+                q[name] = min(hi, max(lo, fnum(v[name].get(), hw.HUNT_DEFAULTS[name])))
+            q["pickup_times"] = int(q["pickup_times"])
+            q["pause_on_hp_drop"] = bool(v["pause_on_hp_drop"].get())
+            hw.apply_hunt_preset(self.cfg, q)
+            self.refresh_gvars()
+            win.destroy()
+            self.render_skill_keys()
+            self.refresh_scen_list(select=0)
+            if self.save():
+                self.msg.config(text="Охота настроена и сохранена. Переключитесь в игру — программа сама возьмёт цель.",
+                                foreground="#286b2e")
+
+        ttk.Button(btns, text="Отмена", command=win.destroy).pack(side="right")
+        ttk.Button(btns, text="Применить и сохранить", command=apply).pack(side="right", padx=6)
+        win.update_idletasks()
+        x = self.win.winfo_rootx() + (self.win.winfo_width() - win.winfo_width()) // 2
+        y = self.win.winfo_rooty() + 40
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+        self._hunt_win, self._hunt_vars, self._hunt_apply = win, v, apply
 
     # ---------- список ----------
 
@@ -1407,6 +1510,17 @@ class SettingsWindow:
         ttk.Label(f, foreground="#555", wraplength=380, justify="left", text=(
             "Лучше оставлять Ctrl+Alt+…, чтобы не пересекаться с клавишами игры."
         )).pack(anchor="w", pady=(6, 0))
+
+    def refresh_gvars(self):
+        """Поля вкладок заново берут значения из self.cfg (после быстрой настройки)."""
+        for path, var, kind in self.gvars:
+            cur = self._g_get(path)
+            if kind is bool:
+                var.set(bool(cur))
+            elif kind is str:
+                var.set(cur or "")
+            else:
+                var.set(f"{cur:g}" if isinstance(cur, (int, float)) else "")
 
     def collect_general(self):
         if not hasattr(self, "gvars"):
