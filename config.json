@@ -3,6 +3,7 @@
     "window_title": "Часть заголовка окна игры. Пусто — координаты считаются от угла экрана. Удобнее всего привязать окно горячей клавишей bind_window.",
     "bars": "Координаты полосок относительно окна игры. Заполняются калибровкой, руками трогать не обязательно.",
     "scenarios": "Сценарий срабатывает, когда выполнены ВСЕ условия. Условия: {\"event\": \"target_died\"} или {\"value\": \"target_hp|my_hp|my_mp\", \"op\": \"<\", \"than\": 40}. Операции: < <= > >= == !=. Меньше priority — проверяется раньше. cooldown — секунды.",
+    "targeting": "Как брать цель шагом find_target: mode nexttarget — клавишей /nexttarget; vision — найти на экране белые имена монстров, кликнуть под ближайшим и проверить окно цели (не нашёл — /nexttarget, если fallback_nexttarget). area — где искать имена (доли окна: x1, y1, x2, y2); self_point/self_radius — где стоит ваш персонаж (его ник и ник пета там не трогаем); click_offsets — на сколько px ниже имени кликать.",
     "wait_target": "Шаг [\"wait_target\", 2.0] — дождаться живой цели (HP > 0), но не дольше 2 с. Не дождались — остальные шаги сценария пропускаются.",
     "actions": "Список [клавиша, пауза после нажатия в секундах]. Клавиши: f1..f12, 0..9, a..z, esc, enter, space, tab, up/down/left/right. Сочетания через +: \"ctrl+1\". [\"wait\", 1.5] — просто пауза.",
     "skill_keys": "Именованные кнопки панели скиллов. В действиях пишите \"@attack\" вместо \"f1\" — тогда при переносе скилла на другую клавишу достаточно поменять её здесь. Можно добавлять свои имена: \"buff\": \"f5\", \"heal\": \"alt+1\".",
@@ -55,6 +56,32 @@
     "hold_key": "x",
     "point": null,
     "return_cursor": true
+  },
+  "targeting": {
+    "mode": "nexttarget",
+    "fallback_nexttarget": true,
+    "area": [
+      0.03,
+      0.19,
+      0.97,
+      0.62
+    ],
+    "self_point": [
+      0.5,
+      0.43
+    ],
+    "self_radius": [
+      0.14,
+      0.07
+    ],
+    "click_offsets": [
+      22,
+      45,
+      70
+    ],
+    "max_clicks": 5,
+    "confirm_time": 0.7,
+    "min_bright": 175
   },
   "vision": {
     "band": 3,
@@ -147,7 +174,8 @@
     "pickup_delay": 0.5,
     "search_after": 1.0,
     "attack_repeat": 2.0,
-    "pause_on_hp_drop": false
+    "pause_on_hp_drop": false,
+    "target_mode": "vision"
   },
   "record_into": "После убийства моба",
   "record_last_delay": 0.5,

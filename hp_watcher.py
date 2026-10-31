@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HP Watcher v2.7 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
+HP Watcher v2.8 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
 нажатий клавиш по условиям. Все настройки — в config.json рядом со скриптом.
 Инструкция — в README.md.
 """
@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler
 
 import numpy as np
 
-VERSION = "2.7"
+VERSION = "2.8"
 IS_WIN = sys.platform == "win32"
 
 if IS_WIN:
@@ -69,6 +69,7 @@ HUNT_DEFAULTS = {
     "attack": "f1", "next_target": "f2", "pickup": "f4", "potion": "f9",
     "potion_hp": 50, "potion_cooldown": 10, "pickup_times": 3, "pickup_delay": 0.5,
     "search_after": 1.0, "attack_repeat": 2.0, "pause_on_hp_drop": False,
+    "target_mode": "vision",
 }
 BAR_NAMES = {"target_hp": "HP цели", "my_hp": "моё HP", "my_mp": "моё MP"}
 VALUE_KEYS = BAR_KEYS + ["no_target_sec"]
@@ -107,6 +108,10 @@ DEFAULT_CONFIG = {
         "scenarios": "Сценарий срабатывает, когда выполнены ВСЕ условия. Условия: {\"event\": \"target_died\"} "
                      "или {\"value\": \"target_hp|my_hp|my_mp\", \"op\": \"<\", \"than\": 40}. "
                      "Операции: < <= > >= == !=. Меньше priority — проверяется раньше. cooldown — секунды.",
+        "targeting": "Как брать цель шагом find_target: mode nexttarget — клавишей /nexttarget; vision — найти на экране "
+                     "белые имена монстров, кликнуть под ближайшим и проверить окно цели (не нашёл — /nexttarget, если "
+                     "fallback_nexttarget). area — где искать имена (доли окна: x1, y1, x2, y2); self_point/self_radius — "
+                     "где стоит ваш персонаж (его ник и ник пета там не трогаем); click_offsets — на сколько px ниже имени кликать.",
         "wait_target": "Шаг [\"wait_target\", 2.0] — дождаться живой цели (HP > 0), но не дольше 2 с. "
                        "Не дождались — остальные шаги сценария пропускаются.",
         "actions": "Список [клавиша, пауза после нажатия в секундах]. Клавиши: f1..f12, 0..9, a..z, esc, enter, "
@@ -172,6 +177,17 @@ DEFAULT_CONFIG = {
         "hold_key": "x",
         "point": None,
         "return_cursor": True,
+    },
+    "targeting": {
+        "mode": "nexttarget",
+        "fallback_nexttarget": True,
+        "area": [0.03, 0.19, 0.97, 0.62],
+        "self_point": [0.5, 0.43],
+        "self_radius": [0.14, 0.07],
+        "click_offsets": [22, 45, 70],
+        "max_clicks": 5,
+        "confirm_time": 0.7,
+        "min_bright": 175,
     },
     "vision": {
         "band": 3,
@@ -893,7 +909,7 @@ HUNT_NAMES = ["Банка HP", "После убийства моба", "Посл
 
 def hunt_scenarios(p):
     """Цикл охоты: взять цель → бить → убил → подобрать дроп → следующая цель… + банка по HP."""
-    take = [["@next_target", 0.2], ["wait_target", 2.0], ["@attack", 0.3]]
+    take = [["find_target", 2.0], ["@attack", 0.3]]
     pick = [["@pickup", float(p["pickup_delay"])] for _ in range(int(p["pickup_times"]))] if p.get("pickup") else []
     return [
         {"name": "Банка HP", "enabled": bool(p.get("potion")), "cooldown": float(p["potion_cooldown"]),
@@ -932,6 +948,8 @@ def apply_hunt_preset(cfg, p):
         sc["priority"] = (len(new) + i + 1) * 10
     cfg["scenarios"] = new + rest
     cfg["hunt"] = {k: p[k] for k in HUNT_DEFAULTS}
+    tg = cfg.setdefault("targeting", copy.deepcopy(DEFAULT_CONFIG["targeting"]))
+    tg["mode"] = "vision" if p.get("target_mode") == "vision" else "nexttarget"
     # В охоте резкое падение HP лечится банкой, а не паузой (на паузе банка не нажмётся).
     # Пауза на смерть остаётся.
     em = cfg.setdefault("emergency", {})
@@ -944,6 +962,98 @@ def apply_hunt_preset(cfg, p):
         if n not in offered:
             offered.append(n)
     return cfg
+
+
+# ---------- Поиск монстров по именам на экране ----------
+
+def text_mask(rgb, min_bright=175, max_chroma=45):
+    """Белый/светло-серый текст: яркий и почти без цвета."""
+    rgb = np.asarray(rgb, dtype=np.int16)
+    mn, mx = rgb.min(axis=-1), rgb.max(axis=-1)
+    return (mn >= min_bright) & (mx - mn <= max_chroma)
+
+
+def find_name_boxes(rgb, min_bright=175, cell=4, gap_cells=2, min_h=7, max_h=30, min_w=50, max_w=340):
+    """Ищет строки белого текста (имена над мобами). Возвращает [(x1, y1, x2, y2), ...] в координатах rgb."""
+    from collections import deque
+    m = text_mask(rgb, min_bright)
+    H, W = m.shape
+    gh, gw = H // cell, W // cell
+    if gh == 0 or gw == 0:
+        return []
+    g = m[:gh * cell, :gw * cell].reshape(gh, cell, gw, cell).any(axis=(1, 3))
+    d = g.copy()
+    for k in range(1, gap_cells + 1):  # склеиваем буквы и слова в одну строку
+        d[:, k:] |= g[:, :-k]
+        d[:, :-k] |= g[:, k:]
+    seen = np.zeros_like(d)
+    boxes = []
+    for y0, x0 in zip(*np.nonzero(d)):
+        if seen[y0, x0]:
+            continue
+        q = deque([(y0, x0)])
+        seen[y0, x0] = True
+        ys, xs = [y0], [x0]
+        while q:
+            y, x = q.popleft()
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < gh and 0 <= nx < gw and d[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    q.append((ny, nx))
+                    ys.append(ny)
+                    xs.append(nx)
+        y1, y2, x1, x2 = min(ys) * cell, (max(ys) + 1) * cell, min(xs) * cell, (max(xs) + 1) * cell
+        sub = m[y1:y2, x1:x2]
+        rows, cols = np.flatnonzero(sub.any(axis=1)), np.flatnonzero(sub.any(axis=0))
+        if rows.size == 0:
+            continue
+        y1, y2, x1, x2 = y1 + rows[0], y1 + rows[-1] + 1, x1 + cols[0], x1 + cols[-1] + 1
+        h, w = y2 - y1, x2 - x1
+        dens = float(m[y1:y2, x1:x2].mean())
+        if min_h <= h <= max_h and min_w <= w <= max_w and w >= 2.5 * h and 0.08 <= dens <= 0.6:
+            boxes.append((int(x1), int(y1), int(x2), int(y2)))
+    return boxes
+
+
+def target_candidates(rgb, tcfg, exclude=()):
+    """Имена мобов в окне игры (rgb — весь кадр окна), без вашего ника и ника пета, ближайшие к персонажу первыми.
+    exclude — прямоугольники (x1, y1, x2, y2), где искать не надо (окно цели и т. п.)."""
+    H, W, _ = rgb.shape
+    ax1, ay1, ax2, ay2 = tcfg.get("area", [0.03, 0.19, 0.97, 0.62])
+    X1, Y1, X2, Y2 = int(W * ax1), int(H * ay1), int(W * ax2), int(H * ay2)
+    boxes = [(x1 + X1, y1 + Y1, x2 + X1, y2 + Y1)
+             for (x1, y1, x2, y2) in find_name_boxes(rgb[Y1:Y2, X1:X2], int(tcfg.get("min_bright", 175)))]
+    sx, sy = tcfg.get("self_point", [0.5, 0.43])
+    rx, ry = tcfg.get("self_radius", [0.14, 0.07])
+    px, py = W * sx, H * sy
+    out = []
+    for b in boxes:
+        cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+        if abs(cx - px) < W * rx and abs(cy - py) < H * ry:
+            continue  # ваш ник и ник пета
+        if cx > W * 0.85 and cy < H * 0.32:
+            continue  # миникарта
+        if any(e[0] <= cx <= e[2] and e[1] <= cy <= e[3] for e in exclude):
+            continue
+        out.append(b)
+    out.sort(key=lambda b: ((b[0] + b[2]) / 2 - px) ** 2 + (((b[1] + b[3]) / 2 - py) * 1.5) ** 2)
+    return out
+
+
+def draw_boxes(rgb, boxes, color, points=(), pcolor=(255, 0, 255)):
+    img = np.array(rgb, dtype=np.uint8, copy=True)
+    H, W, _ = img.shape
+    for (x1, y1, x2, y2) in boxes:
+        x1, x2, y1, y2 = max(0, x1 - 2), min(W - 1, x2 + 2), max(0, y1 - 2), min(H - 1, y2 + 2)
+        img[y1, x1:x2 + 1] = color
+        img[y2, x1:x2 + 1] = color
+        img[y1:y2 + 1, x1] = color
+        img[y1:y2 + 1, x2] = color
+    for (x, y) in points:
+        img[max(0, y - 6):y + 7, max(0, x - 1):x + 2] = pcolor
+        img[max(0, y - 1):y + 2, max(0, x - 6):x + 7] = pcolor
+    return img
 
 
 def known_keys():
@@ -1152,6 +1262,12 @@ def press_key(key, hold):
         finally:
             for m in reversed(mods):
                 INPUT.key_up(m)
+
+
+def random_hold(ck):
+    import random
+    lo, hi = (list(ck.get("hold_ms") or [8, 20]) + [20])[:2]
+    return random.uniform(min(lo, hi), max(lo, hi)) / 1000
 
 
 def mouse_click(button, hold):
@@ -1369,7 +1485,7 @@ class App:
                     continue
                 if key == "wait":
                     continue
-                if parse_mouse(key) or key == "wait_target":
+                if parse_mouse(key) or key in ("wait_target", "find_target"):
                     continue
                 real = resolve_key(key, self.cfg.get("skill_keys", {}))
                 if real is None:
@@ -1946,6 +2062,15 @@ class App:
                 if not self.can_continue():
                     ok = False
                     break
+                if key == "find_target":
+                    got = self.find_target(delay, dry)
+                    if got is None:
+                        ok = False
+                        break
+                    if not got:
+                        log.info("  цель не нашлась — остальные шаги пропускаю")
+                        break
+                    continue
                 if key == "wait_target":
                     got = self.wait_live_target(delay, dry)
                     if got is None:
@@ -1992,6 +2117,104 @@ class App:
         if not ok:
             reason = self.pause_reason or "пауза, выход или окно игры не активно"
             log.info("  прервано (%s)", reason)
+
+    def live_target(self):
+        r = self.vision.get("target_hp")
+        return bool(r and r["status"] == "ok" and r["value"] and r["value"] > 0)
+
+    def target_exclusions(self, W, H):
+        """Где имена искать не надо: окно цели (там тоже белое имя)."""
+        b = self.cfg["bars"].get("target_hp")
+        if not bar_ready(b):
+            return []
+        return [(b["x1"] - 80, b["y"] - 60, b["x2"] + 80, b["y"] + 25)]
+
+    def scan_targets(self, sct=None):
+        """Снимок окна игры и кандидаты-мобы. Возвращает (rgb, кандидаты) или (None, [])."""
+        sct = sct or self._sct
+        origin, _ = self.get_origin()
+        if origin is None or sct is None:
+            return None, []
+        ox, oy, w, h = origin
+        rgb = np.array(grab_rgb(sct, ox, oy, w, h))
+        return rgb, target_candidates(rgb, self.cfg.get("targeting", {}), self.target_exclusions(w, h))
+
+    def find_target(self, timeout, dry=False):
+        """Взять живую цель. Зрением: клик под ником ближайшего моба и проверка окна цели.
+        Не вышло (или режим nexttarget) — клавиша /nexttarget и ожидание живой цели.
+        True — цель есть, False — не нашли, None — прервали."""
+        tcfg = self.cfg.get("targeting", {})
+        if self.live_target():
+            return True
+        if tcfg.get("mode") == "vision":
+            got = self.vision_target(tcfg, dry)
+            if got is None or got:
+                return got
+            if not tcfg.get("fallback_nexttarget", True):
+                return False
+            log.info("  зрением цель не взял — пробую /nexttarget")
+        real = resolve_key("@next_target", self.cfg.get("skill_keys", {}))
+        if real is None:
+            log.warning("  кнопка @next_target не задана")
+            return False
+        if dry:
+            log.info("  [тест] нажал бы @next_target (%s)", real)
+        else:
+            self.wait_modifiers_released()
+            press_key(real, float(self.cfg.get("key_hold", 0.05)))
+            log.info("  нажал @next_target (%s)", real)
+        if not self.sleep_interruptible(0.2):
+            return None
+        return self.wait_live_target(timeout, dry)
+
+    def vision_target(self, tcfg, dry=False):
+        rgb, cands = self.scan_targets()
+        if rgb is None:
+            return False
+        now = time.time()
+        self._bad_points = [(x, y, t) for (x, y, t) in getattr(self, "_bad_points", []) if now - t < 10]
+        cands = [b for b in cands if not any(abs((b[0] + b[2]) / 2 - x) < 40 and abs(b[3] - y) < 30
+                                             for (x, y, _) in self._bad_points)]
+        offsets = [int(o) for o in tcfg.get("click_offsets", [22, 45, 70])] or [30]
+        plan = [(int((b[0] + b[2]) / 2), b[3] + o, b) for b in cands for o in offsets][:int(tcfg.get("max_clicks", 5))]
+        log.info("  зрение: имён мобов на экране %d", len(cands))
+        if self.cfg["screenshots"].get("on_scenario", True):
+            self.save_debug_shot(draw_boxes(rgb, cands, (0, 255, 0), [(x, y) for x, y, _ in plan]), "поиск цели")
+        if not plan:
+            return False
+        if dry:
+            log.info("  [тест] кликнул бы под ником в (%d, %d)", plan[0][0], plan[0][1])
+            return True
+        ck = self.cfg.get("clicker", {})
+        hold = random_hold(ck)
+        confirm = float(tcfg.get("confirm_time", 0.7))
+        for (x, y, b) in plan:
+            if not self.can_continue():
+                return None
+            self.wait_modifiers_released()
+            try:
+                perform_mouse({"kind": "click", "button": "left", "count": 1, "point": (x, y)}, hold, self.origin,
+                              return_cursor=False)
+            except Exception as e:
+                log.warning("  зрение: клик не удался: %s", e)
+                return False
+            t0 = time.time()
+            while time.time() - t0 < confirm:
+                if not self.sleep_interruptible(0.05):
+                    return None
+                if self.live_target():
+                    log.info("  зрение: взял цель кликом в (%d, %d), HP %.0f%%", x, y, self.values.get("target_hp", 0))
+                    self._vision_target_point = (int((b[0] + b[2]) / 2), b[3])
+                    return True
+            log.info("  зрение: клик в (%d, %d) мимо", x, y)
+            self._bad_points.append((int((b[0] + b[2]) / 2), b[3], time.time()))
+        return False
+
+    def save_debug_shot(self, img, reason):
+        sc = self.cfg.get("screenshots", {})
+        if not sc.get("enabled", True):
+            return
+        threading.Thread(target=self._save_shot, args=(img, reason, {}, sc), daemon=True).start()
 
     def wait_live_target(self, timeout, dry=False):
         """Ждёт, пока в цели окажется живой моб (HP > 0, достоверно). True — дождались,
@@ -2115,7 +2338,15 @@ class App:
             if reason:
                 self.emergency_stop(reason)
 
+    def forget_vision_target(self):
+        """Труп / потерянный моб: его ник ещё на экране — не кликать в него снова."""
+        pt = getattr(self, "_vision_target_point", None)
+        if pt:
+            self._bad_points = getattr(self, "_bad_points", []) + [(pt[0], pt[1], time.time())]
+            self._vision_target_point = None
+
     def on_target_killed(self, how):
+        self.forget_vision_target()
         self.target_alive = False
         self.target_last_hp = None
         # на паузе убийство считаем, но сценарий по нему потом не запускаем
@@ -2127,6 +2358,7 @@ class App:
             self.screenshot(f"убийство {self.stats.kills}")
 
     def on_target_lost(self, last):
+        self.forget_vision_target()
         self.target_alive = False
         self.target_last_hp = None
         if not self.paused and not self.recording:

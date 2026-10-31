@@ -170,7 +170,7 @@ def check_key(key, skill_keys, mapping):
     """Пустая строка — ок, иначе текст ошибки."""
     if not key:
         return "пустая клавиша"
-    if key in ("wait", "wait_target"):
+    if key in ("wait", "wait_target", "find_target"):
         return ""
     if hw.parse_mouse(key):
         return ""
@@ -392,7 +392,7 @@ class SettingsWindow:
     def key_choices(self):
         sk = self.skill_keys()
         named = [f"@{n}  ({str(k).upper()})" for n, k in sk.items() if k]
-        return named + COMMON_KEYS + MOUSE_CHOICES + ["wait", "wait_target"]
+        return named + COMMON_KEYS + MOUSE_CHOICES + ["wait", "wait_target", "find_target"]
 
     def validate(self):
         errors = []
@@ -620,7 +620,22 @@ class SettingsWindow:
             ttk.Label(row, text=unit).pack(side="left")
 
         key_row(1, "attack", "Атака", "«Атака» из окна действий (Alt+C)")
-        key_row(2, "next_target", "Следующая цель", "/nexttarget")
+        key_row(2, "next_target", "Следующая цель", "/nexttarget (и запасной вариант для зрения)")
+        tm = ttk.Frame(f)
+        tm.grid(row=16, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Label(tm, text="Как брать цель:").pack(side="left")
+        v["target_mode"] = tk.StringVar(value=p.get("target_mode", "vision"))
+        ttk.Radiobutton(tm, text="зрением — клик под ником ближайшего моба", value="vision",
+                        variable=v["target_mode"]).pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(tm, text="/nexttarget", value="nexttarget",
+                        variable=v["target_mode"]).pack(side="left", padx=(8, 0))
+        tt = ttk.Frame(f)
+        tt.grid(row=17, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ttk.Button(tt, text="Проверить поиск мобов (через 3 с)",
+                   command=lambda: self.countdown(scan_label, "Переключитесь в игру", lambda: self.test_scan(scan_label))
+                   ).pack(side="left")
+        scan_label = ttk.Label(tt, text="", foreground="#286b2e", wraplength=360, justify="left")
+        scan_label.pack(side="left", padx=8)
         num_row(3, "search_after", "Брать цель, если её нет", 0.5, 30, 0.5, "сек (и сразу после запуска)")
         num_row(4, "attack_repeat", "Повторять атаку в бою раз в", 0.5, 30, 0.5, "сек")
         key_row(5, "pickup", "Подбор дропа", "«Поднять»; пусто — не подбирать")
@@ -643,7 +658,7 @@ class SettingsWindow:
             "будут заменены и встанут наверх списка. Остальные ваши сценарии останутся ниже."
         )).grid(row=12, column=0, columnspan=4, sticky="w", pady=(8, 0))
         btns = ttk.Frame(f)
-        btns.grid(row=15, column=0, columnspan=4, sticky="e", pady=(12, 0))
+        btns.grid(row=18, column=0, columnspan=4, sticky="e", pady=(12, 0))
 
         def apply():
             q = {}
@@ -662,6 +677,7 @@ class SettingsWindow:
                 q[name] = min(hi, max(lo, fnum(v[name].get(), hw.HUNT_DEFAULTS[name])))
             q["pickup_times"] = int(q["pickup_times"])
             q["pause_on_hp_drop"] = bool(v["pause_on_hp_drop"].get())
+            q["target_mode"] = v["target_mode"].get()
             hw.apply_hunt_preset(self.cfg, q)
             self.refresh_gvars()
             win.destroy()
@@ -682,6 +698,38 @@ class SettingsWindow:
         except tk.TclError:
             pass
         self._hunt_win, self._hunt_vars, self._hunt_apply = win, v, apply
+
+    def test_scan(self, label):
+        """Ищет имена мобов на текущем экране игры и сохраняет картинку с найденным в screenshots."""
+        import mss
+        try:
+            with mss.mss() as sct:
+                rgb, cands = self.app.scan_targets(sct)
+        except Exception as e:
+            label.config(text=f"Ошибка: {e}", foreground="#a33")
+            return
+        if rgb is None:
+            label.config(text="Окно игры не найдено — привяжите его на вкладке «Полоски»", foreground="#a33")
+            return
+        tc = self.app.cfg.get("targeting", {})
+        offs = tc.get("click_offsets", [22, 45, 70])
+        pts = [(int((b[0] + b[2]) / 2), b[3] + int(offs[0])) for b in cands[:5]]
+        img = hw.draw_boxes(rgb, cands, (0, 255, 0), pts)
+        folder = hw.os.path.join(hw.app_dir(), self.app.cfg.get("screenshots", {}).get("folder", "screenshots"))
+        try:
+            import mss.tools
+            hw.os.makedirs(folder, exist_ok=True)
+            path = hw.os.path.join(folder, "проверка_поиска_мобов.png")
+            mss.tools.to_png(img.tobytes(), (img.shape[1], img.shape[0]), output=path)
+            where = f" Картинка: {hw.os.path.relpath(path, hw.app_dir())}"
+        except Exception:
+            where = ""
+        if cands:
+            b = cands[0]
+            label.config(text=f"Найдено мобов: {len(cands)}. Ближайший — имя в ({b[0]}, {b[1]}), клик будет в "
+                              f"({pts[0][0]}, {pts[0][1]}).{where}", foreground="#286b2e")
+        else:
+            label.config(text="Имён мобов не найдено. Включите в игре показ имён монстров." + where, foreground="#a33")
 
     # ---------- список ----------
 
@@ -905,9 +953,11 @@ class SettingsWindow:
                 acts[i] = [k, max(0.0, fnum(vd.get(), 0))]
                 e = check_key(k, self.skill_keys(), self.mapping())
                 ms = hw.parse_mouse(k)
-                if k == "wait_target" and not e:
-                    err.config(text="ждать новую живую цель, но не дольше указанного времени; "
-                               "не появилась — остальные шаги пропускаются", foreground="#555")
+                if k in ("wait_target", "find_target") and not e:
+                    err.config(text=("ждать новую живую цель, но не дольше указанного времени; "
+                                     "не появилась — остальные шаги пропускаются") if k == "wait_target" else
+                               ("взять цель (как настроено в «Быстрой настройке охоты»: зрением или /nexttarget) "
+                                "и дождаться её; не вышло — остальные шаги пропускаются"), foreground="#555")
                     err.grid()
                     return
                 if e:
