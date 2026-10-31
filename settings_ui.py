@@ -169,7 +169,7 @@ def check_key(key, skill_keys, mapping):
     """Пустая строка — ок, иначе текст ошибки."""
     if not key:
         return "пустая клавиша"
-    if key == "wait":
+    if key in ("wait", "wait_target"):
         return ""
     if hw.parse_mouse(key):
         return ""
@@ -391,7 +391,7 @@ class SettingsWindow:
     def key_choices(self):
         sk = self.skill_keys()
         named = [f"@{n}  ({str(k).upper()})" for n, k in sk.items() if k]
-        return named + COMMON_KEYS + MOUSE_CHOICES + ["wait"]
+        return named + COMMON_KEYS + MOUSE_CHOICES + ["wait", "wait_target"]
 
     def validate(self):
         errors = []
@@ -571,6 +571,7 @@ class SettingsWindow:
         ttk.Button(sb, text="+ Нажатие", command=lambda: self.step_add(["f1", 0.3])).pack(side="left")
         ttk.Button(sb, text="+ Пауза", command=lambda: self.step_add(["wait", 1.0])).pack(side="left", padx=4)
         ttk.Button(sb, text="+ Клик", command=lambda: self.step_add(["click:left", 0.2])).pack(side="left")
+        ttk.Button(sb, text="+ Ждать цель", command=lambda: self.step_add(["wait_target", 2.0])).pack(side="left", padx=4)
         self.rec_btn = ttk.Button(sb, text="⏺ Записать с клавиатуры", command=self.toggle_recording)
         self.rec_btn.pack(side="left")
         self.rec_label = ttk.Label(sb, text="", foreground="#a33")
@@ -801,6 +802,11 @@ class SettingsWindow:
                 acts[i] = [k, max(0.0, fnum(vd.get(), 0))]
                 e = check_key(k, self.skill_keys(), self.mapping())
                 ms = hw.parse_mouse(k)
+                if k == "wait_target" and not e:
+                    err.config(text="ждать новую живую цель, но не дольше указанного времени; "
+                               "не появилась — остальные шаги пропускаются", foreground="#555")
+                    err.grid()
+                    return
                 if e:
                     err.config(text="⚠ " + e, foreground="#a33")
                 elif ms:

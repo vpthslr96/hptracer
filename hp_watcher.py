@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HP Watcher v2.5 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
+HP Watcher v2.6 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
 нажатий клавиш по условиям. Все настройки — в config.json рядом со скриптом.
 Инструкция — в README.md.
 """
@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler
 
 import numpy as np
 
-VERSION = "2.5"
+VERSION = "2.6"
 IS_WIN = sys.platform == "win32"
 
 if IS_WIN:
@@ -101,6 +101,8 @@ DEFAULT_CONFIG = {
         "scenarios": "Сценарий срабатывает, когда выполнены ВСЕ условия. Условия: {\"event\": \"target_died\"} "
                      "или {\"value\": \"target_hp|my_hp|my_mp\", \"op\": \"<\", \"than\": 40}. "
                      "Операции: < <= > >= == !=. Меньше priority — проверяется раньше. cooldown — секунды.",
+        "wait_target": "Шаг [\"wait_target\", 2.0] — дождаться живой цели (HP > 0), но не дольше 2 с. "
+                       "Не дождались — остальные шаги сценария пропускаются.",
         "actions": "Список [клавиша, пауза после нажатия в секундах]. Клавиши: f1..f12, 0..9, a..z, esc, enter, "
                    "space, tab, up/down/left/right. Сочетания через +: \"ctrl+1\". [\"wait\", 1.5] — просто пауза.",
         "skill_keys": "Именованные кнопки панели скиллов. В действиях пишите \"@attack\" вместо \"f1\" — "
@@ -212,7 +214,7 @@ DEFAULT_CONFIG = {
             "priority": 10,
             "cooldown": 0,
             "conditions": [{"event": "target_died"}],
-            "actions": [["@next_target", 0.4], ["@attack", 0.3]],
+            "actions": [["@next_target", 0.2], ["wait_target", 2.0], ["@attack", 0.3]],
         },
         {
             "name": "После потери цели",
@@ -220,7 +222,15 @@ DEFAULT_CONFIG = {
             "priority": 15,
             "cooldown": 0,
             "conditions": [{"event": "target_lost"}],
-            "actions": [["@next_target", 0.4], ["@attack", 0.3]],
+            "actions": [["@next_target", 0.2], ["wait_target", 2.0], ["@attack", 0.3]],
+        },
+        {
+            "name": "Атака в бою",
+            "enabled": True,
+            "priority": 18,
+            "cooldown": 2,
+            "conditions": [{"value": "target_hp", "op": ">", "than": 0}],
+            "actions": [["@attack", 0.1]],
         },
         {
             "name": "Поиск цели",
@@ -228,7 +238,7 @@ DEFAULT_CONFIG = {
             "priority": 20,
             "cooldown": 3,
             "conditions": [{"value": "no_target_sec", "op": ">=", "than": 4}],
-            "actions": [["@next_target", 0.4], ["@attack", 0.3]],
+            "actions": [["@next_target", 0.2], ["wait_target", 2.0], ["@attack", 0.3]],
         },
         {
             "name": "Скилл в бою",
@@ -316,6 +326,7 @@ def fill_percent(mask, min_run=2):
 # ---------- Зрение v2: полоса пикселей, два цвета, оптимальная граница, самопроверка ----------
 
 OTHER, FILL, EMPTY = 0, 1, 2
+OLD_DEFAULT_ACTIONS = [["@next_target", 0.4], ["@attack", 0.3]]  # до v2.6 — обновляем автоматически
 UNIFORM_STD = 14   # заливка и пустота полоски однородны; пёстрый фон — нет
 
 
@@ -1232,12 +1243,25 @@ class App:
                     new["enabled"] = False
                     log.info("Сценарий «%s» добавлен выключенным: нет кнопок %s — задайте их в настройках",
                              d["name"], ", ".join(missing))
+                # встать по приоритету сразу после соседа из списка готовых (если он есть у пользователя)
+                names = [x["name"] for x in DEFAULT_CONFIG["scenarios"]]
+                prev = [by_name[n] for n in names[:names.index(d["name"])] if n in by_name]
+                if prev:
+                    new["priority"] = float(prev[-1].get("priority", 100)) + 5
                 scs.append(new)
+                by_name[new["name"]] = new
                 log.info("В config.json добавлен сценарий «%s» (%s)", d["name"],
                          "включён" if new.get("enabled", True) else "выключен")
             elif not cur.get("actions") and d.get("actions"):
                 cur["actions"] = copy.deepcopy(d["actions"])
                 log.info("Сценарий «%s»: добавлены действия по умолчанию %s", d["name"], d["actions"])
+        new_by_name = {d["name"]: d for d in DEFAULT_CONFIG["scenarios"]}
+        for sc in scs:
+            d = new_by_name.get(sc.get("name"))
+            if d and sc.get("actions") == OLD_DEFAULT_ACTIONS and d["actions"] != OLD_DEFAULT_ACTIONS:
+                sc["actions"] = copy.deepcopy(d["actions"])
+                log.info("Сценарий «%s»: атака теперь жмётся после того, как появилась новая цель", sc["name"])
+                changed = True
         self.cfg["offered_defaults"] = offered
         return changed
 
@@ -1278,7 +1302,7 @@ class App:
                     continue
                 if key == "wait":
                     continue
-                if parse_mouse(key):
+                if parse_mouse(key) or key == "wait_target":
                     continue
                 real = resolve_key(key, self.cfg.get("skill_keys", {}))
                 if real is None:
@@ -1855,6 +1879,15 @@ class App:
                 if not self.can_continue():
                     ok = False
                     break
+                if key == "wait_target":
+                    got = self.wait_live_target(delay, dry)
+                    if got is None:
+                        ok = False
+                        break
+                    if not got:
+                        log.info("  новая живая цель не появилась за %g с — остальные шаги пропускаю", delay)
+                        break
+                    continue
                 mspec = parse_mouse(key)
                 if mspec:
                     ck = self.cfg.get("clicker", {})
@@ -1892,6 +1925,23 @@ class App:
         if not ok:
             reason = self.pause_reason or "пауза, выход или окно игры не активно"
             log.info("  прервано (%s)", reason)
+
+    def wait_live_target(self, timeout, dry=False):
+        """Ждёт, пока в цели окажется живой моб (HP > 0, достоверно). True — дождались,
+        False — нет за timeout, None — прервали (пауза, выход, окно не активно)."""
+        t0 = time.time()
+        while True:
+            r = self.vision.get("target_hp")
+            if r and r["status"] == "ok" and r["value"] and r["value"] > 0:
+                log.info("  цель есть (HP %.0f%%) через %.1f с", r["value"], time.time() - t0)
+                return True
+            if dry and time.time() - t0 >= min(timeout, 0.5):
+                log.info("  [тест] ждал бы живую цель до %g с", timeout)
+                return True
+            if time.time() - t0 >= timeout:
+                return False
+            if not self.sleep_interruptible(0.05):
+                return None
 
     def poll(self, force=False):
         """Читает экран, обновляет значения, статистику, события и аварийный детектор."""
