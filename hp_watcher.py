@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HP Watcher v2.9 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
+HP Watcher v2.10 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
 нажатий клавиш по условиям. Все настройки — в config.json рядом со скриптом.
 Инструкция — в README.md.
 """
@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler
 
 import numpy as np
 
-VERSION = "2.9"
+VERSION = "2.10"
 IS_WIN = sys.platform == "win32"
 
 if IS_WIN:
@@ -1296,7 +1296,7 @@ def mouse_click(button, hold):
         INPUT.mouse_button(button, False)
 
 
-def perform_mouse(spec, hold, origin, interval=0.1, return_cursor=True):
+def perform_mouse(spec, hold, origin, interval=0.1, return_cursor=True, settle=0.03):
     """Выполняет шаг мыши. origin — (x, y, w, h) окна игры для точек."""
     back = None
     with INPUT_LOCK:
@@ -1306,7 +1306,7 @@ def perform_mouse(spec, hold, origin, interval=0.1, return_cursor=True):
             if return_cursor and IS_WIN:
                 back = cursor_pos()
             INPUT.mouse_move(origin[0] + spec["point"][0], origin[1] + spec["point"][1])
-            time.sleep(0.02)
+            time.sleep(settle)  # игра должна успеть увидеть курсор на новом месте (обрабатывает ввод раз в кадр)
         try:
             if spec["kind"] == "move":
                 back = None  # «move» и должен оставить курсор там
@@ -2143,11 +2143,17 @@ class App:
         return bool(r and r["status"] == "ok" and r["value"] and r["value"] > 0)
 
     def target_exclusions(self, W, H):
-        """Где имена искать не надо: окно цели (там тоже белое имя)."""
+        """Где имена искать не надо: окно цели (там тоже белое имя) и окно статуса программы."""
+        out = []
         b = self.cfg["bars"].get("target_hp")
-        if not bar_ready(b):
-            return []
-        return [(b["x1"] - 80, b["y"] - 60, b["x2"] + 80, b["y"] + 25)]
+        if bar_ready(b):
+            out.append((b["x1"] - 80, b["y"] - 60, b["x2"] + 80, b["y"] + 25))
+        r = getattr(self, "overlay_rect", None)
+        if r and self.origin:
+            x, y, w, h = r
+            ox, oy = self.origin[0], self.origin[1]
+            out.append((x - ox - 15, y - oy - 15, x - ox + w + 15, y - oy + h + 15))
+        return out
 
     def scan_targets(self, sct=None):
         """Снимок окна игры и кандидаты-мобы. Возвращает (rgb, кандидаты) или (None, [])."""
@@ -2219,7 +2225,7 @@ class App:
         """Навести курсор на точку окна игры (без клика) и вернуть номер курсора."""
         with INPUT_LOCK:
             INPUT.mouse_move(self.origin[0] + x, self.origin[1] + y)
-        time.sleep(0.05)
+        time.sleep(0.08)
         return cursor_handle()
 
     def fresh_candidates(self, tcfg):
@@ -2248,7 +2254,8 @@ class App:
         max_clicks = int(tcfg.get("max_clicks", 5))
         confirm = float(tcfg.get("confirm_time", 0.7))
         use_hover = bool(tcfg.get("hover_check", True)) and IS_WIN
-        hold = random_hold(self.cfg.get("clicker", {}))
+        # клик по цели не короче 0.08 с: слишком короткое нажатие игра может не заметить
+        hold = max(float(self.cfg.get("key_hold", 0.05)), 0.08, random_hold(self.cfg.get("clicker", {})))
         clicks, last_w, off_i, first = 0, None, 0, True
         for _ in range(max_clicks * 3):
             if not self.can_continue():
@@ -2281,23 +2288,19 @@ class App:
             self.wait_modifiers_released()
             found = None
             if use_hover:
-                # навести курсор: над мобом курсор игры меняется — так кликаем без промахов по земле
+                # подсказка: над мобом курсор игры может меняться — тогда кликаем именно в эту точку.
+                # Не поменялся — всё равно кликаем (в некоторых клиентах курсор не меняется или меняется с задержкой).
                 neutral = self.hover(cx, max(0, b[1] - 30))
                 for o in offsets[off_i:]:
                     hnd = self.hover(cx, b[3] + o)
                     if neutral is not None and hnd is not None and hnd != neutral:
                         found = o
                         break
-                if self._cursor_works and found is None:
-                    log.info("  зрение: под ником (%d, %d) курсор не меняется — моба там нет, следующий", cx, b[3])
-                    self._bad_points.append((cx, b[3], time.time()))
-                    last_w = None
-                    continue
             o = found if found is not None else offsets[off_i]
             x, y = cx, b[3] + o
             try:
                 perform_mouse({"kind": "click", "button": "left", "count": 1, "point": (x, y)}, hold, self.origin,
-                              return_cursor=False)
+                              return_cursor=False, settle=0.1)
             except Exception as e:
                 log.warning("  зрение: клик не удался: %s", e)
                 return False
@@ -2311,7 +2314,7 @@ class App:
                     self._vision_target_point = (cx, b[3], w)
                     if found is not None and not self._cursor_works:
                         self._cursor_works = True
-                        log.info("  зрение: курсор над мобом меняется — дальше проверяю наведением, без кликов по земле")
+                        log.info("  зрение: курсор над мобом меняется — подсказка наведением работает")
                     return True
             log.info("  зрение: клик в (%d, %d) мимо", x, y)
             if found is not None:
@@ -2648,8 +2651,9 @@ class Overlay:
         self.root.configure(bg="#1d1f24")
         x, y = app.cfg.get("status_window_pos", [20, 200])
         self.root.geometry(f"+{int(x)}+{int(y)}")
+        # цвет текста — не белый: белый текст поиск целей принимает за ники мобов
         self.label = tk.Label(self.root, text="", justify="left", anchor="w",
-                              font=("Consolas", 10), fg="#e6e6e6", bg="#1d1f24",
+                              font=("Consolas", 10), fg="#9fe0a0", bg="#1d1f24",
                               padx=10, pady=6, cursor="fleur")
         self.label.pack(fill="x")
         self.label.bind("<ButtonPress-1>", self._drag_start)
@@ -2664,7 +2668,7 @@ class Overlay:
                           ("⏸ Пауза", lambda: threading.Thread(target=app.toggle_pause, daemon=True).start()),
                           ("Тест", lambda: threading.Thread(target=app.toggle_dry_run, daemon=True).start()),
                           ("Кликер", lambda: threading.Thread(target=app.toggle_clicker, daemon=True).start())):
-            b = tk.Label(self.btns, text=text, font=("Segoe UI", 9), fg="#e6e6e6", bg="#30343c",
+            b = tk.Label(self.btns, text=text, font=("Segoe UI", 9), fg="#9fd0ff", bg="#30343c",
                          padx=8, pady=2, cursor="hand2")
             b.pack(side="left", padx=2)
             b.bind("<Button-1>", lambda e, cmd=cmd: cmd())
@@ -2760,6 +2764,12 @@ class Overlay:
                     settings_ui.SettingsWindow.open(self.root, self.app)
                 except Exception:
                     log.exception("Не удалось открыть настройки")
+        if self.show:
+            try:
+                self.app.overlay_rect = (self.root.winfo_rootx(), self.root.winfo_rooty(),
+                                         self.root.winfo_width(), self.root.winfo_height())
+            except Exception:
+                pass
         bg = self.app.status_colors()
         self.label.config(text=self.app.status_text(), bg=bg)
         self.root.configure(bg=bg)
