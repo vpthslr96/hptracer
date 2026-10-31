@@ -81,7 +81,10 @@
     ],
     "max_clicks": 5,
     "confirm_time": 0.7,
-    "min_bright": 175
+    "min_bright": 175,
+    "wait_still": 1.5,
+    "still_threshold": 5.0,
+    "hover_check": true
   },
   "vision": {
     "band": 3,

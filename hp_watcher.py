@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HP Watcher v2.8 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
+HP Watcher v2.9 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
 нажатий клавиш по условиям. Все настройки — в config.json рядом со скриптом.
 Инструкция — в README.md.
 """
@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler
 
 import numpy as np
 
-VERSION = "2.8"
+VERSION = "2.9"
 IS_WIN = sys.platform == "win32"
 
 if IS_WIN:
@@ -188,6 +188,9 @@ DEFAULT_CONFIG = {
         "max_clicks": 5,
         "confirm_time": 0.7,
         "min_bright": 175,
+        "wait_still": 1.5,
+        "still_threshold": 5.0,
+        "hover_check": True,
     },
     "vision": {
         "band": 3,
@@ -1264,6 +1267,22 @@ def press_key(key, hold):
                 INPUT.key_up(m)
 
 
+class CURSORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint32), ("flags", ctypes.c_uint32),
+                ("hCursor", ctypes.c_void_p), ("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def cursor_handle():
+    """Какой курсор сейчас показан (номер). None — неизвестно (не Windows или курсор рисует сама игра)."""
+    if not IS_WIN:
+        return None
+    ci = CURSORINFO()
+    ci.cbSize = ctypes.sizeof(CURSORINFO)
+    if not user32.GetCursorInfo(ctypes.byref(ci)) or not (ci.flags & 1):
+        return None
+    return ci.hCursor
+
+
 def random_hold(ck):
     import random
     lo, hi = (list(ck.get("hold_ms") or [8, 20]) + [20])[:2]
@@ -1342,6 +1361,7 @@ class App:
         self.clicker_on = False
         self.clicker_state = "выкл"
         self._clicker_dry = [0, 0.0]
+        self._cursor_works = False  # меняется ли курсор игры над мобом (выясняется в бою)
         self.vision = {}            # последнее чтение каждой полоски (для окна «Что видит программа»)
         self.target_absent = 0
         self.target_last_hp = None
@@ -2167,47 +2187,137 @@ class App:
             return None
         return self.wait_live_target(timeout, dry)
 
-    def vision_target(self, tcfg, dry=False):
+    def screen_motion(self):
+        """Насколько сдвинулась картинка за ~0.1 с (средняя разница яркости по центру окна, грубо)."""
+        origin = self.origin
+        if origin is None or self._sct is None:
+            return 0.0
+        ox, oy, w, h = origin
+        box = (ox + w // 5, oy + h // 5, w * 3 // 5, h * 3 // 5)
+        a = np.asarray(grab_rgb(self._sct, *box))[::8, ::8].astype(np.int16).mean(axis=-1)
+        time.sleep(0.1)
+        b = np.asarray(grab_rgb(self._sct, *box))[::8, ::8].astype(np.int16).mean(axis=-1)
+        return float(np.abs(a - b).mean())
+
+    def wait_still(self, tcfg):
+        """Ждём, пока персонаж добежит и камера встанет: иначе моб уедет из точки клика."""
+        limit = float(tcfg.get("wait_still", 1.5))
+        thr = float(tcfg.get("still_threshold", 5.0))
+        t0 = time.time()
+        while time.time() - t0 < limit:
+            m = self.screen_motion()
+            if m < thr:
+                if time.time() - t0 > 0.15:
+                    log.info("  зрение: подождал, пока камера встанет (%.1f с)", time.time() - t0)
+                return True
+            if not self.sleep_interruptible(0.02):
+                return None
+        log.info("  зрение: картинка всё ещё движется — ищу как есть")
+        return True
+
+    def hover(self, x, y):
+        """Навести курсор на точку окна игры (без клика) и вернуть номер курсора."""
+        with INPUT_LOCK:
+            INPUT.mouse_move(self.origin[0] + x, self.origin[1] + y)
+        time.sleep(0.05)
+        return cursor_handle()
+
+    def fresh_candidates(self, tcfg):
         rgb, cands = self.scan_targets()
         if rgb is None:
-            return False
+            return None, []
         now = time.time()
-        self._bad_points = [(x, y, t) for (x, y, t) in getattr(self, "_bad_points", []) if now - t < 10]
-        cands = [b for b in cands if not any(abs((b[0] + b[2]) / 2 - x) < 40 and abs(b[3] - y) < 30
-                                             for (x, y, _) in self._bad_points)]
+        H, W, _ = rgb.shape
+        self._bad_points = [p for p in getattr(self, "_bad_points", []) if now - p[2] < 6]
+        self._corpses = [c for c in getattr(self, "_corpses", []) if now - c[1] < 15]
+        sx, sy = tcfg.get("self_point", [0.5, 0.43])
+
+        def bad(b):
+            cx, w = (b[0] + b[2]) / 2, b[2] - b[0]
+            if any(abs(cx - x) < 40 and abs(b[3] - y) < 30 for (x, y, _) in self._bad_points):
+                return True
+            # ник трупа: такой же ширины и недалеко от персонажа (персонаж только что подбирал рядом с ним дроп)
+            near = abs(cx - W * sx) < W * 0.2 and abs(b[3] - H * sy) < H * 0.16
+            return near and any(abs(w - cw) <= 3 for (cw, _) in self._corpses)
+        return rgb, [b for b in cands if not bad(b)]
+
+    def vision_target(self, tcfg, dry=False):
+        """Цель зрением: дождаться, пока камера встанет → свежий снимок → ближайший ник → (наведение) → клик →
+        проверка окна цели. После каждого промаха всё заново: персонаж мог сдвинуться."""
         offsets = [int(o) for o in tcfg.get("click_offsets", [22, 45, 70])] or [30]
-        plan = [(int((b[0] + b[2]) / 2), b[3] + o, b) for b in cands for o in offsets][:int(tcfg.get("max_clicks", 5))]
-        log.info("  зрение: имён мобов на экране %d", len(cands))
-        if self.cfg["screenshots"].get("on_scenario", True):
-            self.save_debug_shot(draw_boxes(rgb, cands, (0, 255, 0), [(x, y) for x, y, _ in plan]), "поиск цели")
-        if not plan:
-            return False
-        if dry:
-            log.info("  [тест] кликнул бы под ником в (%d, %d)", plan[0][0], plan[0][1])
-            return True
-        ck = self.cfg.get("clicker", {})
-        hold = random_hold(ck)
+        max_clicks = int(tcfg.get("max_clicks", 5))
         confirm = float(tcfg.get("confirm_time", 0.7))
-        for (x, y, b) in plan:
+        use_hover = bool(tcfg.get("hover_check", True)) and IS_WIN
+        hold = random_hold(self.cfg.get("clicker", {}))
+        clicks, last_w, off_i, first = 0, None, 0, True
+        for _ in range(max_clicks * 3):
             if not self.can_continue():
                 return None
+            if self.wait_still(tcfg) is None:
+                return None
+            rgb, cands = self.fresh_candidates(tcfg)
+            if rgb is None:
+                return False
+            if first:
+                log.info("  зрение: имён мобов на экране %d", len(cands))
+                if self.cfg["screenshots"].get("on_scenario", True) and cands:
+                    b0 = cands[0]
+                    pts = [(int((b0[0] + b0[2]) / 2), b0[3] + o) for o in offsets]
+                    self.save_debug_shot(draw_boxes(rgb, cands, (0, 255, 0), pts), "поиск цели")
+                first = False
+            if not cands:
+                return False
+            b = cands[0]
+            cx, w = int((b[0] + b[2]) / 2), b[2] - b[0]
+            if dry:
+                log.info("  [тест] кликнул бы под ником в (%d, %d)", cx, b[3] + offsets[0])
+                return True
+            off_i = off_i + 1 if (last_w is not None and abs(w - last_w) <= 3) else 0  # тот же моб — ниже
+            if off_i >= len(offsets):
+                self._bad_points.append((cx, b[3], time.time()))
+                last_w = None
+                continue
+            last_w = w
             self.wait_modifiers_released()
+            found = None
+            if use_hover:
+                # навести курсор: над мобом курсор игры меняется — так кликаем без промахов по земле
+                neutral = self.hover(cx, max(0, b[1] - 30))
+                for o in offsets[off_i:]:
+                    hnd = self.hover(cx, b[3] + o)
+                    if neutral is not None and hnd is not None and hnd != neutral:
+                        found = o
+                        break
+                if self._cursor_works and found is None:
+                    log.info("  зрение: под ником (%d, %d) курсор не меняется — моба там нет, следующий", cx, b[3])
+                    self._bad_points.append((cx, b[3], time.time()))
+                    last_w = None
+                    continue
+            o = found if found is not None else offsets[off_i]
+            x, y = cx, b[3] + o
             try:
                 perform_mouse({"kind": "click", "button": "left", "count": 1, "point": (x, y)}, hold, self.origin,
                               return_cursor=False)
             except Exception as e:
                 log.warning("  зрение: клик не удался: %s", e)
                 return False
+            clicks += 1
             t0 = time.time()
             while time.time() - t0 < confirm:
                 if not self.sleep_interruptible(0.05):
                     return None
                 if self.live_target():
                     log.info("  зрение: взял цель кликом в (%d, %d), HP %.0f%%", x, y, self.values.get("target_hp", 0))
-                    self._vision_target_point = (int((b[0] + b[2]) / 2), b[3])
+                    self._vision_target_point = (cx, b[3], w)
+                    if found is not None and not self._cursor_works:
+                        self._cursor_works = True
+                        log.info("  зрение: курсор над мобом меняется — дальше проверяю наведением, без кликов по земле")
                     return True
             log.info("  зрение: клик в (%d, %d) мимо", x, y)
-            self._bad_points.append((int((b[0] + b[2]) / 2), b[3], time.time()))
+            if found is not None:
+                off_i = offsets.index(found)
+            if clicks >= max_clicks:
+                break
         return False
 
     def save_debug_shot(self, img, reason):
@@ -2343,6 +2453,7 @@ class App:
         pt = getattr(self, "_vision_target_point", None)
         if pt:
             self._bad_points = getattr(self, "_bad_points", []) + [(pt[0], pt[1], time.time())]
+            self._corpses = getattr(self, "_corpses", []) + [(pt[2], time.time())]
             self._vision_target_point = None
 
     def on_target_killed(self, how):
