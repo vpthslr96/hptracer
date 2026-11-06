@@ -172,7 +172,7 @@ def check_key(key, skill_keys, mapping):
     """Пустая строка — ок, иначе текст ошибки."""
     if not key:
         return "пустая клавиша"
-    if key in ("wait", "wait_target", "find_target"):
+    if key in ("wait", "wait_target", "find_target", "switch_target"):
         return ""
     if hw.parse_mouse(key):
         return ""
@@ -394,7 +394,7 @@ class SettingsWindow:
     def key_choices(self):
         sk = self.skill_keys()
         named = [f"@{n}  ({str(k).upper()})" for n, k in sk.items() if k]
-        return named + COMMON_KEYS + MOUSE_CHOICES + ["wait", "wait_target", "find_target"]
+        return named + COMMON_KEYS + MOUSE_CHOICES + ["wait", "wait_target", "find_target", "switch_target"]
 
     def validate(self):
         errors = []
@@ -957,7 +957,7 @@ class SettingsWindow:
                 acts[i] = [k, max(0.0, fnum(vd.get(), 0))]
                 e = check_key(k, self.skill_keys(), self.mapping())
                 ms = hw.parse_mouse(k)
-                if k in ("wait_target", "find_target") and not e:
+                if k in ("wait_target", "find_target", "switch_target") and not e:
                     err.config(text=("ждать новую живую цель, но не дольше указанного времени; "
                                      "не появилась — остальные шаги пропускаются") if k == "wait_target" else
                                ("взять цель (как настроено в «Быстрой настройке охоты»: зрением или /nexttarget) "

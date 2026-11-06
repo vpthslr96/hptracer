@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HP Watcher v2.13 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
+HP Watcher v2.14 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
 нажатий клавиш по условиям. Все настройки — в config.json рядом со скриптом.
 Инструкция — в README.md.
 """
@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler
 
 import numpy as np
 
-VERSION = "2.13"
+VERSION = "2.14"
 IS_WIN = sys.platform == "win32"
 
 if IS_WIN:
@@ -75,6 +75,7 @@ VALUE_KEYS = BAR_KEYS + ["no_target_sec", "target_stuck_sec"]
 MIN_REPEAT = 0.3  # сценарий без события не повторяется чаще, чем раз в столько секунд
 OVERLAY_COLORS = {"target_hp": "#ffd400", "my_hp": "#3cff6a", "my_mp": "#38d6ff"}
 EVENTS = {"target_died", "target_lost"}
+ACTION_STEPS = ("wait_target", "find_target", "switch_target")  # шаги сценария, а не клавиши
 OPS = {"<": operator.lt, "<=": operator.le, ">": operator.gt,
        ">=": operator.ge, "==": operator.eq, "!=": operator.ne}
 MODIFIERS = {"ctrl", "alt", "shift", "win", "ctrlleft", "ctrlright", "altleft",
@@ -97,7 +98,9 @@ DEFAULT_CONFIG = {
         "targeting": "Как брать цель шагом find_target: mode nexttarget — клавишей /nexttarget; vision — найти на экране "
                      "белые имена монстров, кликнуть под ближайшим и проверить окно цели (не нашёл — /nexttarget, если "
                      "fallback_nexttarget). area — где искать имена (доли окна: x1, y1, x2, y2); self_point/self_radius — "
-                     "где стоит ваш персонаж (его ник и ник пета там не трогаем); click_offsets — на сколько px ниже имени кликать.",
+                     "где стоит ваш персонаж (его ник и ник пета там не трогаем); click_offsets — на сколько px ниже имени кликать. "
+                     "clear_key — клавиша «снять цель» (в игре Esc): перед поиском труп снимается из цели, чтобы по окну "
+                     "цели отличить живого моба, труп и промах; пусто — не снимать.",
         "wait_target": "Шаг [\"wait_target\", 2.0] — дождаться живой цели (HP > 0), но не дольше 2 с. "
                        "Не дождались — остальные шаги сценария пропускаются.",
         "actions": "Список [клавиша, пауза после нажатия в секундах]. Клавиши: f1..f12, 0..9, a..z, esc, enter, "
@@ -177,6 +180,7 @@ DEFAULT_CONFIG = {
         "wait_still": 1.5,
         "still_threshold": 5.0,
         "hover_check": True,
+        "clear_key": "esc",
     },
     "vision": {
         "band": 3,
@@ -338,6 +342,7 @@ def fill_percent(mask, min_run=2):
 
 OTHER, FILL, EMPTY = 0, 1, 2
 OLD_DEFAULT_ACTIONS = [["@next_target", 0.4], ["@attack", 0.3]]  # до v2.6 — обновляем автоматически
+OLD_STUCK_ACTIONS = [["@next_target", 0.5], ["@attack", 0.3]]    # «Застрял на мобе» до v2.14
 UNIFORM_STD = 14   # заливка и пустота полоски однородны; пёстрый фон — нет
 
 
@@ -910,7 +915,7 @@ def hunt_scenarios(p):
         {"name": "Застрял на мобе", "enabled": float(p.get("stuck_after") or 0) > 0,
          "cooldown": max(2.0, float(p.get("stuck_after") or 8)),
          "conditions": [{"value": "target_stuck_sec", "op": ">=", "than": max(2.0, float(p.get("stuck_after") or 8))}],
-         "actions": [["@next_target", 0.5], ["@attack", 0.3]]},
+         "actions": [["switch_target", 2.0], ["@attack", 0.3]]},
         {"name": "Атака в бою", "enabled": True, "cooldown": float(p["attack_repeat"]),
          "conditions": [{"value": "target_hp", "op": ">", "than": 0}], "actions": [["@attack", 0.1]]},
         {"name": "Взять цель", "enabled": True, "cooldown": 2,
@@ -1480,6 +1485,10 @@ class App:
                 log.info("Сценарий «%s»: добавлены действия по умолчанию %s", d["name"], d["actions"])
         new_by_name = {d["name"]: d for d in DEFAULT_CONFIG["scenarios"]}
         for sc in scs:
+            if sc.get("name") == "Застрял на мобе" and sc.get("actions") == OLD_STUCK_ACTIONS:
+                sc["actions"] = [["switch_target", 2.0], ["@attack", 0.3]]
+                log.info("Сценарий «Застрял на мобе»: теперь недоступный моб запоминается и берётся другой")
+                changed = True
             d = new_by_name.get(sc.get("name"))
             if d and sc.get("actions") == OLD_DEFAULT_ACTIONS and d["actions"] != OLD_DEFAULT_ACTIONS:
                 sc["actions"] = copy.deepcopy(d["actions"])
@@ -1534,7 +1543,7 @@ class App:
                     continue
                 if key == "wait":
                     continue
-                if parse_mouse(key) or key in ("wait_target", "find_target"):
+                if parse_mouse(key) or key in ACTION_STEPS:
                     continue
                 real = resolve_key(key, self.cfg.get("skill_keys", {}))
                 if real is None:
@@ -2080,8 +2089,8 @@ class App:
                 if not self.can_continue():
                     ok = False
                     break
-                if key == "find_target":
-                    got = self.find_target(delay, dry)
+                if key in ("find_target", "switch_target"):
+                    got = (self.find_target if key == "find_target" else self.switch_target)(delay, dry)
                     if got is None:
                         ok = False
                         break
@@ -2181,15 +2190,27 @@ class App:
         if real is None:
             log.warning("  кнопка @next_target не задана")
             return False
-        if dry:
-            log.info("  [тест] нажал бы @next_target (%s)", real)
-        else:
-            self.wait_modifiers_released()
-            press_key(real, float(self.cfg.get("key_hold", 0.05)))
-            log.info("  нажал @next_target (%s)", real)
-        if not self.sleep_interruptible(0.2):
-            return None
-        return self.wait_live_target(timeout, dry)
+        # /nexttarget берёт моба не всегда (никого перед камерой, моб за спиной) — жмём повторно,
+        # пока не появится живая цель, а не ждём весь timeout после одного нажатия.
+        t0, presses = time.time(), 0
+        while True:
+            if dry:
+                log.info("  [тест] нажал бы @next_target (%s)", real)
+            else:
+                self.wait_modifiers_released()
+                press_key(real, float(self.cfg.get("key_hold", 0.05)))
+                presses += 1
+            left = timeout - (time.time() - t0)
+            got = self.wait_live_target(min(0.8, max(0.2, left)), dry, quiet=True)
+            if got is None:
+                return None
+            if got:
+                log.info("  нажал @next_target (%s)%s — цель есть (HP %.0f%%) через %.1f с", real,
+                         f" ×{presses}" if presses > 1 else "", self.values.get("target_hp", 0), time.time() - t0)
+                return True
+            if time.time() - t0 >= timeout:
+                log.info("  нажал @next_target (%s) ×%d — живой цели нет", real, presses)
+                return False
 
     def screen_motion(self):
         """Насколько сдвинулась картинка за ~0.1 с (средняя разница яркости по центру окна, грубо)."""
@@ -2232,18 +2253,77 @@ class App:
             return None, []
         now = time.time()
         H, W, _ = rgb.shape
-        self._bad_points = [p for p in getattr(self, "_bad_points", []) if now - p[2] < 6]
-        self._corpses = [c for c in getattr(self, "_corpses", []) if now - c[1] < 15]
-        sx, sy = tcfg.get("self_point", [0.5, 0.43])
+        # Плохие точки: (x, y, когда, сколько помнить, радиус) — труп, недоступный моб, промахи.
+        # Трупы НЕ отсеиваем по ширине ника: у мобов одного вида ники одинаковые, и так отсеивались живые.
+        # Труп узнаём после клика: в окне цели HP 0 (см. vision_target).
+        self._bad_points = [p for p in getattr(self, "_bad_points", []) if now - p[2] < p[3]]
 
         def bad(b):
-            cx, w = (b[0] + b[2]) / 2, b[2] - b[0]
-            if any(abs(cx - x) < 40 and abs(b[3] - y) < 30 for (x, y, _) in self._bad_points):
-                return True
-            # ник трупа: такой же ширины и недалеко от персонажа (персонаж только что подбирал рядом с ним дроп)
-            near = abs(cx - W * sx) < W * 0.2 and abs(b[3] - H * sy) < H * 0.16
-            return near and any(abs(w - cw) <= 3 for (cw, _) in self._corpses)
+            cx = (b[0] + b[2]) / 2
+            return any(abs(cx - x) < r and abs(b[3] - y) < r * 0.75 for (x, y, _, _, r) in self._bad_points)
         return rgb, [b for b in cands if not bad(b)]
+
+    def mark_bad(self, x, y, ttl=8.0, radius=40):
+        self._bad_points = getattr(self, "_bad_points", []) + [(x, y, time.time(), ttl, radius)]
+
+    def target_state(self):
+        """live — в цели живой моб; dead — окно цели есть, HP 0 (труп); none — окна цели нет; unsure — не ясно."""
+        r = self.vision.get("target_hp")
+        if not r:
+            return "unsure"
+        if r["status"] == "ok":
+            return "live" if r["value"] and r["value"] > 0 else "dead"
+        return "none" if r["status"] == "absent" else "unsure"
+
+    def clear_target(self, dry=False):
+        """Снять цель клавишей clear_key (Esc). True — окно цели закрылось, False — нет (или клавиша не задана),
+        None — прервали. Нужно, чтобы после клика по окну цели было видно, кого выбрали."""
+        key = str(self.cfg.get("targeting", {}).get("clear_key") or "").strip().lower()
+        if not key:
+            return False
+        if dry:
+            log.info("  [тест] нажал бы %s — снять цель", key)
+            return True
+        self.wait_modifiers_released()
+        press_key(key, float(self.cfg.get("key_hold", 0.05)))
+        t0 = time.time()
+        while time.time() - t0 < 0.6:
+            if not self.sleep_interruptible(0.05):
+                return None
+            if self.target_state() == "none":
+                return True
+        log.info("  %s не сняла цель — окно цели на месте", key)
+        return False
+
+    def switch_target(self, timeout, dry=False):
+        """«Застрял на мобе»: урон не проходит. Зрением — запомнить, где был этот моб, снять цель и взять
+        другого. Клавишей — /nexttarget (игра сама берёт следующего)."""
+        tcfg = self.cfg.get("targeting", {})
+        if tcfg.get("mode") == "vision":
+            pt = getattr(self, "_vision_target_point", None)
+            if pt:
+                self.mark_bad(pt[0], pt[1], ttl=25, radius=70)
+                self._vision_target_point = None
+            self.target_alive, self._stuck = False, None  # это не «потеря цели», событие не нужно
+            got = self.clear_target(dry)
+            if got is None:
+                return None
+            if got:
+                return self.find_target(timeout, dry)
+        real = resolve_key("@next_target", self.cfg.get("skill_keys", {}))
+        if real is None:
+            log.warning("  кнопка @next_target не задана")
+            return False
+        self._stuck = None
+        if dry:
+            log.info("  [тест] нажал бы @next_target (%s)", real)
+        else:
+            self.wait_modifiers_released()
+            press_key(real, float(self.cfg.get("key_hold", 0.05)))
+            log.info("  нажал @next_target (%s)", real)
+        if not self.sleep_interruptible(0.3):
+            return None
+        return self.wait_live_target(timeout, dry)
 
     def vision_target(self, tcfg, dry=False):
         """Цель зрением: дождаться, пока камера встанет → свежий снимок → ближайший ник → (наведение) → клик →
@@ -2254,7 +2334,17 @@ class App:
         use_hover = bool(tcfg.get("hover_check", True)) and IS_WIN
         # клик по цели не короче 0.08 с: слишком короткое нажатие игра может не заметить
         hold = max(float(self.cfg.get("key_hold", 0.05)), 0.08, random_hold(self.cfg.get("clicker", {})))
-        clicks, last_w, off_i, first = 0, None, 0, True
+        clicks, last_pt, off_i, first = 0, None, 0, True
+        # Труп в цели снимаем (Esc): тогда после клика окно цели честно скажет, кого выбрали —
+        # живого моба, труп (HP 0) или никого (промах).
+        cleared = False
+        if self.target_state() == "dead":
+            got = self.clear_target(dry)
+            if got is None:
+                return None
+            cleared = bool(got)
+        elif self.target_state() == "none":
+            cleared = True
         for _ in range(max_clicks * 3):
             if not self.can_continue():
                 return None
@@ -2277,12 +2367,13 @@ class App:
             if dry:
                 log.info("  [тест] кликнул бы под ником в (%d, %d)", cx, b[3] + offsets[0])
                 return True
-            off_i = off_i + 1 if (last_w is not None and abs(w - last_w) <= 3) else 0  # тот же моб — ниже
+            same = last_pt is not None and abs(cx - last_pt[0]) <= 25 and abs(b[3] - last_pt[1]) <= 20
+            off_i = off_i + 1 if same else 0  # тот же моб после промаха — кликаем ниже
             if off_i >= len(offsets):
-                self._bad_points.append((cx, b[3], time.time()))
-                last_w = None
+                self.mark_bad(cx, b[3])
+                last_pt = None
                 continue
-            last_w = w
+            last_pt = (cx, b[3])
             self.wait_modifiers_released()
             found = None
             if use_hover:
@@ -2303,10 +2394,14 @@ class App:
                 log.warning("  зрение: клик не удался: %s", e)
                 return False
             clicks += 1
-            t0 = time.time()
+            t0, dead_since = time.time(), None
             while time.time() - t0 < confirm:
                 if not self.sleep_interruptible(0.05):
                     return None
+                st = self.target_state()
+                dead_since = (dead_since or time.time()) if st == "dead" else None
+                if cleared and dead_since and time.time() - dead_since >= 0.2:
+                    break  # окно цели появилось с HP 0 — это труп
                 if self.live_target():
                     log.info("  зрение: взял цель кликом в (%d, %d), HP %.0f%%", x, y, self.values.get("target_hp", 0))
                     self._vision_target_point = (cx, b[3], w)
@@ -2314,6 +2409,17 @@ class App:
                         self._cursor_works = True
                         log.info("  зрение: курсор над мобом меняется — подсказка наведением работает")
                     return True
+            if cleared and dead_since:
+                log.info("  зрение: в (%d, %d) труп — пропускаю его", x, y)
+                self.mark_bad(cx, b[3], ttl=15)
+                last_pt = None
+                got = self.clear_target()
+                if got is None:
+                    return None
+                cleared = bool(got)
+                if clicks >= max_clicks:
+                    break
+                continue
             log.info("  зрение: клик в (%d, %d) мимо", x, y)
             if found is not None:
                 off_i = offsets.index(found)
@@ -2327,14 +2433,15 @@ class App:
             return
         threading.Thread(target=self._save_shot, args=(img, reason, {}, sc), daemon=True).start()
 
-    def wait_live_target(self, timeout, dry=False):
+    def wait_live_target(self, timeout, dry=False, quiet=False):
         """Ждёт, пока в цели окажется живой моб (HP > 0, достоверно). True — дождались,
         False — нет за timeout, None — прервали (пауза, выход, окно не активно)."""
         t0 = time.time()
         while True:
             r = self.vision.get("target_hp")
             if r and r["status"] == "ok" and r["value"] and r["value"] > 0:
-                log.info("  цель есть (HP %.0f%%) через %.1f с", r["value"], time.time() - t0)
+                if not quiet:
+                    log.info("  цель есть (HP %.0f%%) через %.1f с", r["value"], time.time() - t0)
                 return True
             if dry and time.time() - t0 >= min(timeout, 0.5):
                 log.info("  [тест] ждал бы живую цель до %g с", timeout)
@@ -2462,8 +2569,7 @@ class App:
         """Труп / потерянный моб: его ник ещё на экране — не кликать в него снова."""
         pt = getattr(self, "_vision_target_point", None)
         if pt:
-            self._bad_points = getattr(self, "_bad_points", []) + [(pt[0], pt[1], time.time())]
-            self._corpses = getattr(self, "_corpses", []) + [(pt[2], time.time())]
+            self.mark_bad(pt[0], pt[1])
             self._vision_target_point = None
 
     def on_target_killed(self, how):
