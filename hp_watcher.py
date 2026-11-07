@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HP Watcher v2.14 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
+HP Watcher v2.15 — следит за полосками HP/MP в Lineage 2 и выполняет сценарии
 нажатий клавиш по условиям. Все настройки — в config.json рядом со скриптом.
 Инструкция — в README.md.
 """
@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler
 
 import numpy as np
 
-VERSION = "2.14"
+VERSION = "2.15"
 IS_WIN = sys.platform == "win32"
 
 if IS_WIN:
@@ -65,6 +65,7 @@ LOG_PATH = os.path.join(app_dir(), "hp_watcher.log")
 BAR_KEYS = ["target_hp", "my_hp", "my_mp"]
 # Быстрая настройка охоты: значения по умолчанию
 HUNT_DEFAULTS = {
+    "enabled": True, "fight_max": 120.0, "search_timeout": 2.0,
     "attack": "f1", "next_target": "f2", "pickup": "f4", "potion": "f9",
     "potion_hp": 50, "potion_cooldown": 10, "pickup_times": 3, "pickup_delay": 0.5,
     "search_after": 1.0, "attack_repeat": 2.0, "pause_on_hp_drop": False,
@@ -220,41 +221,9 @@ DEFAULT_CONFIG = {
     },
     "offered_defaults": [],
     "hunt": dict(HUNT_DEFAULTS),
-    "record_into": "После убийства моба",
+    "record_into": "Записанный сценарий",
     "record_last_delay": 0.5,
     "scenarios": [
-        {
-            "name": "После убийства моба",
-            "enabled": True,
-            "priority": 10,
-            "cooldown": 0,
-            "conditions": [{"event": "target_died"}],
-            "actions": [["@next_target", 0.2], ["wait_target", 2.0], ["@attack", 0.3]],
-        },
-        {
-            "name": "После потери цели",
-            "enabled": True,
-            "priority": 15,
-            "cooldown": 0,
-            "conditions": [{"event": "target_lost"}],
-            "actions": [["@next_target", 0.2], ["wait_target", 2.0], ["@attack", 0.3]],
-        },
-        {
-            "name": "Атака в бою",
-            "enabled": True,
-            "priority": 18,
-            "cooldown": 2,
-            "conditions": [{"value": "target_hp", "op": ">", "than": 0}],
-            "actions": [["@attack", 0.1]],
-        },
-        {
-            "name": "Поиск цели",
-            "enabled": False,
-            "priority": 20,
-            "cooldown": 3,
-            "conditions": [{"value": "no_target_sec", "op": ">=", "than": 4}],
-            "actions": [["@next_target", 0.2], ["wait_target", 2.0], ["@attack", 0.3]],
-        },
         {
             "name": "Скилл в бою",
             "enabled": False,
@@ -270,14 +239,6 @@ DEFAULT_CONFIG = {
             "cooldown": 1200,
             "conditions": [{"value": "no_target_sec", "op": ">=", "than": 1}],
             "actions": [["f5", 2.0]],
-        },
-        {
-            "name": "Банка HP",
-            "enabled": False,
-            "priority": 1,
-            "cooldown": 15,
-            "conditions": [{"value": "my_hp", "op": "<", "than": 40}],
-            "actions": [["f9", 0.3]],
         },
         {
             "name": "Банка MP",
@@ -900,30 +861,6 @@ def scan_code(name):
 HUNT_NAMES = ["Банка HP", "После убийства моба", "После потери цели", "Застрял на мобе", "Атака в бою", "Взять цель"]
 
 
-def hunt_scenarios(p):
-    """Цикл охоты: взять цель → бить → убил → подобрать дроп → следующая цель… + банка по HP."""
-    take = [["find_target", 2.0], ["@attack", 0.3]]
-    pick = [["@pickup", float(p["pickup_delay"])] for _ in range(int(p["pickup_times"]))] if p.get("pickup") else []
-    return [
-        {"name": "Банка HP", "enabled": bool(p.get("potion")), "cooldown": float(p["potion_cooldown"]),
-         "conditions": [{"value": "my_hp", "op": "<", "than": float(p["potion_hp"])}],
-         "actions": [["@potion", 0.2]]},
-        {"name": "После убийства моба", "enabled": True, "cooldown": 0,
-         "conditions": [{"event": "target_died"}], "actions": pick + copy.deepcopy(take)},
-        {"name": "После потери цели", "enabled": True, "cooldown": 0,
-         "conditions": [{"event": "target_lost"}], "actions": copy.deepcopy(take)},
-        {"name": "Застрял на мобе", "enabled": float(p.get("stuck_after") or 0) > 0,
-         "cooldown": max(2.0, float(p.get("stuck_after") or 8)),
-         "conditions": [{"value": "target_stuck_sec", "op": ">=", "than": max(2.0, float(p.get("stuck_after") or 8))}],
-         "actions": [["switch_target", 2.0], ["@attack", 0.3]]},
-        {"name": "Атака в бою", "enabled": True, "cooldown": float(p["attack_repeat"]),
-         "conditions": [{"value": "target_hp", "op": ">", "than": 0}], "actions": [["@attack", 0.1]]},
-        {"name": "Взять цель", "enabled": True, "cooldown": 2,
-         "conditions": [{"value": "no_target_sec", "op": ">=", "than": float(p["search_after"])}],
-         "actions": copy.deepcopy(take)},
-    ]
-
-
 def hunt_params(cfg):
     """Настройки охоты так, как их показывает окно быстрой настройки: блок hunt + кнопки панели."""
     p = {**HUNT_DEFAULTS, **(cfg.get("hunt") or {})}
@@ -934,31 +871,34 @@ def hunt_params(cfg):
     return p
 
 
+def hunt_key(cfg, name):
+    """Клавиша охоты: кнопка панели из skill_keys, иначе из блока hunt. None — не задана (не жать)."""
+    k = (cfg.get("skill_keys") or {}).get(name) or (cfg.get("hunt") or {}).get(name)
+    k = str(k or "").strip().lower()
+    return k or None
+
+
 def hunt_problems(cfg):
-    """Чем сценарии в конфиге расходятся с настройками охоты. Пусто — охота применена как надо."""
-    p = hunt_params(cfg)
-    have = {s.get("name"): s for s in cfg.get("scenarios", [])}
+    """Почему охота не сможет работать как настроено. Пусто — всё в порядке."""
+    h = cfg.get("hunt") or {}
+    if not h.get("enabled", True):
+        return []
     out = []
-    for want in hunt_scenarios(p):
-        cur = have.get(want["name"])
-        if cur is None:
-            out.append(f"нет сценария «{want['name']}»")
-        elif want["enabled"] and not cur.get("enabled", True):
-            out.append(f"сценарий «{want['name']}» выключен")
+    for name, text in (("attack", "атаки"), ("next_target", "следующей цели")):
+        if not hunt_key(cfg, name):
+            out.append(f"не задана клавиша {text}")
+    bars = cfg.get("bars") or {}
+    if not bar_ready(bars.get("target_hp")):
+        out.append("не настроена полоска HP цели")
+    if hunt_key(cfg, "potion") and not bar_ready(bars.get("my_hp")):
+        out.append("не настроена полоска «моё HP» — банка не сработает")
     return out
 
 
-def hunt_never_applied(cfg):
-    """Быструю настройку охоты к этому конфигу ни разу не применяли (так выглядит config.json
-    из архива релиза: блок hunt есть, а сценарии старые — без «Взять цель» и с выключенной банкой)."""
-    offered = cfg.get("offered_defaults") or []
-    names = {s.get("name") for s in cfg.get("scenarios", [])}
-    return "Взять цель" not in offered and "Взять цель" not in names
-
-
 def apply_hunt_preset(cfg, p):
-    """Вписывает цикл охоты в конфиг: кнопки панели и 5 сценариев наверху списка.
-    Остальные сценарии пользователя остаются ниже, как были."""
+    """Включает охоту (машина состояний hunt_fsm) с этими настройками и кнопками панели.
+    Старые сценарии охоты (до v2.15) из списка убираются — их работу делает машина.
+    Остальные сценарии пользователя остаются, как были."""
     p = {**HUNT_DEFAULTS, **(p or {})}
     sk = cfg.setdefault("skill_keys", {})
     for name in ("attack", "next_target", "pickup", "potion"):
@@ -969,14 +909,12 @@ def apply_hunt_preset(cfg, p):
     old = cfg.get("scenarios", [])
     # «Поиск цели» прошлых версий — это теперь «Взять цель»
     old = [s for s in old if s.get("name") not in HUNT_NAMES + ["Поиск цели"]]
-    new = hunt_scenarios(p)
-    for i, sc in enumerate(new):
-        sc["priority"] = (i + 1) * 10
     rest = sorted(old, key=lambda s: s.get("priority", 100))
     for i, sc in enumerate(rest):
-        sc["priority"] = (len(new) + i + 1) * 10
-    cfg["scenarios"] = new + rest
+        sc["priority"] = (i + 1) * 10
+    cfg["scenarios"] = rest
     cfg["hunt"] = {k: p[k] for k in HUNT_DEFAULTS}
+    cfg["hunt"]["enabled"] = bool(p.get("enabled", True))
     tg = cfg.setdefault("targeting", copy.deepcopy(DEFAULT_CONFIG["targeting"]))
     tg["mode"] = "vision" if p.get("target_mode") == "vision" else "nexttarget"
     # В охоте резкое падение HP лечится банкой, а не паузой (на паузе банка не нажмётся).
@@ -1418,6 +1356,8 @@ class App:
         self.last_action = "—"
 
         self._rec_hook = None
+        from hunt_fsm import Hunt
+        self.hunt = Hunt(self, press_key=press_key, resolve_key=resolve_key, defaults=HUNT_DEFAULTS)
         self._rec_events = []
         self._rec_held = set()
 
@@ -1495,14 +1435,13 @@ class App:
                 log.info("Сценарий «%s»: атака теперь жмётся после того, как появилась новая цель", sc["name"])
                 changed = True
         self.cfg["offered_defaults"] = offered
-        if hunt_never_applied(self.cfg):
-            # Окно быстрой настройки показывает блок hunt (F9, 50%, 8 с…), значит и работать
-            # должно ровно это. Раньше config.json из релиза затирал применённую охоту.
-            apply_hunt_preset(self.cfg, hunt_params(self.cfg))
-            log.warning("Сценарии охоты не были применены (старый config.json из архива?) — "
-                        "применяю быструю настройку охоты: %s",
-                        ", ".join(s["name"] + ("" if s.get("enabled", True) else " (выкл)")
-                                  for s in self.cfg["scenarios"] if s["name"] in HUNT_NAMES))
+        old_hunt = [x.get("name") for x in scs if x.get("name") in HUNT_NAMES + ["Поиск цели"]]
+        if old_hunt:
+            # До v2.15 охота была шестью сценариями. Теперь это машина состояний с настройками из блока hunt
+            # (их и показывает окно быстрой настройки).
+            apply_hunt_preset(self.cfg, {**hunt_params(self.cfg), "enabled": True})
+            log.warning("Охота теперь работает машиной состояний (поиск → бой → подбор). "
+                        "Старые сценарии охоты убраны из списка: %s", ", ".join(old_hunt))
             changed = True
         return changed
 
@@ -1776,6 +1715,10 @@ class App:
     def request_run_now(self):
         name = self.cfg.get("record_into") or "После убийства моба"
         sc = next((s for s in self.cfg.get("scenarios", []) if s.get("name") == name), None)
+        if (sc is None or not sc.get("actions")) and self.hunting():
+            self.hunt.next_try = 0.0
+            log.info("Проверка: охота включена — %s; поиск цели — сразу", self.hunt.status())
+            return
         if sc is None or not sc.get("actions"):
             log.warning("Сценарий «%s» не найден или пуст", name)
             return
@@ -2551,6 +2494,14 @@ class App:
         ttl = float(cfg["event_ttl"])
         self.events = {k: v for k, v in self.events.items() if now - v <= ttl}
 
+        if (self.hunt.state != "off" and not self.paused and not self.recording and active
+                and not getattr(self, "_in_urgent", False)):
+            self._in_urgent = True
+            try:
+                self.hunt.urgent()
+            finally:
+                self._in_urgent = False
+
         # Аварийный детектор — только когда игра на экране и чтение достоверно
         hp = vals.get("my_hp")
         if hp is not None and active and not self.paused:
@@ -2646,8 +2597,13 @@ class App:
             tr.update(cand=None, hits=0)
             log.info("Окно цели сдвинуто на (%+d, %+d) — полоска найдена на новом месте", dx, dy)
 
+    def hunting(self):
+        return bool((self.cfg.get("hunt") or {}).get("enabled", True))
+
     def tick(self):
         self.poll(force=True)
+        if self.hunt.state != "off" and (self.paused or self.recording or not self.hunting()):
+            self.hunt.stop(why="пауза" if self.paused else "запись" if self.recording else "охота выключена")
         if self.origin is None or self.paused or self.recording:
             return
         if self.cfg.get("only_when_window_active", True) and not self.window_active:
@@ -2661,6 +2617,10 @@ class App:
             if sc:
                 self.run_scenario(sc)
             return
+        if self.hunting():
+            self.hunt.step()
+            if not self.can_continue():
+                return
         sc = self.pick_scenario(self.values, time.time())
         if sc:
             self.run_scenario(sc)
@@ -2688,7 +2648,7 @@ class App:
         elif self.paused:
             state = f"АВАРИЯ: {self.pause_reason}" if self.pause_reason else "ПАУЗА"
         elif self.executing:
-            state = f"выполняю: {self.executing}"
+            state = self.executing if self.executing.startswith("охота") else f"выполняю: {self.executing}"
         else:
             state = "работает"
         if self.origin is None:
@@ -2714,6 +2674,7 @@ class App:
         return "\n".join([
             f"HP Watcher · {state}{test}",
             f"Окно: {win}",
+            f"Охота: {self.hunt.status() if self.hunting() else 'выключена'}",
             f"Цель HP: {pct('target_hp')}",
             f"Моё HP:  {pct('my_hp')}   MP: {pct('my_mp')}",
             self.stats.short(),

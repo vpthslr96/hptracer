@@ -482,7 +482,9 @@ class SettingsWindow:
         left = ttk.Frame(t)
         left.grid(row=0, column=0, sticky="nsw", padx=(0, 10))
         ttk.Button(left, text="⚡ Быстрая настройка охоты…", command=self.open_hunt_wizard).pack(fill="x", pady=(0, 6))
-        ttk.Label(left, text="Сценарии (выше — важнее)").pack(anchor="w")
+        self._g_check(left, ["hunt", "enabled"], "Охота включена: поиск → бой → подбор → …")
+        ttk.Label(left, text="Клавиши, пороги и банка — в быстрой настройке.", foreground="#555").pack(anchor="w")
+        ttk.Label(left, text="Свои сценарии (баффы, скиллы; выше — важнее)").pack(anchor="w", pady=(8, 0))
         cols = ("on", "name", "when", "every")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", height=16, selectmode="browse")
         for c, text, w in (("on", "", 26), ("name", "Название", 150), ("when", "Когда", 160), ("every", "Повтор", 64)):
@@ -652,13 +654,12 @@ class SettingsWindow:
         warn.grid(row=16, column=0, columnspan=4, sticky="w", pady=(8, 0))
         probs = hw.hunt_problems(self.cfg)
         if probs:
-            warn.config(text="Сейчас эти настройки НЕ действуют: " + "; ".join(probs)
-                        + ". Нажмите «Применить и сохранить».")
+            warn.config(text="Охота не сможет работать: " + "; ".join(probs) + ".")
         elif not hw.bar_ready(self.app.cfg["bars"].get("my_hp")):
             warn.config(text="Полоска «моё HP» не настроена — банка не сработает. Настройте её на вкладке «Полоски».")
         ttk.Label(f, foreground="#555", wraplength=520, justify="left", text=(
-            "Сценарии охоты («Банка HP», «После убийства моба», «После потери цели», «Застрял на мобе», "
-            "«Атака в бою», «Взять цель») будут заменены и встанут наверх списка. Остальные ваши сценарии останутся ниже."
+            "Охота работает сама по циклу: поиск цели → бой → подбор → поиск… Банка HP — в любой момент, "
+            "когда HP ниже порога. Ваши сценарии (баффы, скиллы) работают как раньше, между шагами охоты."
         )).grid(row=15, column=0, columnspan=4, sticky="w", pady=(8, 0))
         btns = ttk.Frame(f)
         btns.grid(row=17, column=0, columnspan=4, sticky="e", pady=(12, 0))

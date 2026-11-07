@@ -209,21 +209,22 @@ def run(seconds=60, mode="basic", target_mode="vision"):
     install(game)
     app = make_app(target_mode)
     stop = time.time() + seconds
-    idle = 0.0          # сколько времени не было живой цели
-    last = time.time()
+    idle = [0.0]        # сколько времени в цели не было живого моба (считает «мир», а не цикл программы)
 
     def world():
+        last = time.time()
         while time.time() < stop:
             game.step()
+            now = time.time()
+            if not (game.target and game.target.alive):
+                idle[0] += now - last
+            last = now
             time.sleep(0.05)
     threading.Thread(target=world, daemon=True).start()
     while time.time() < stop:
         app.tick()
-        now = time.time()
-        if not (game.target and game.target.alive):
-            idle += now - last
-        last = now
         time.sleep(0.1)
+    idle = idle[0]
     app.running = False
     print(f"\n=== {mode}/{target_mode}: {seconds} с — убито {game.kills}, программа насчитала "
           f"{app.stats.kills}, без живой цели {idle:.1f} с, кликов {game.clicks} (мимо {game.click_miss})")
